@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebTransport 回聲測試</title>
+<style>
+  body { font-family: sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }
+  #status { font-weight: bold; }
+  #status.ok { color: #0a7d2c; }
+  #status.err { color: #b00020; }
+  textarea { width: 100%; box-sizing: border-box; height: 5em; }
+  pre { background: #f4f4f4; padding: .5em; white-space: pre-wrap; word-break: break-all; }
+  .same { color: #0a7d2c; } .diff { color: #b00020; }
+</style>
+</head>
+<body>
+<h1>WebTransport 回聲測試</h1>
+<p>目標：<code id="target">-</code></p>
+<p>狀態：<span id="status">尚未連線</span></p>
+<pre id="error" hidden></pre>
+
+<textarea id="msg">hello IFP</textarea>
+<p><button id="send" disabled>送出</button></p>
+<p>送出：<pre id="sent">-</pre></p>
+<p>收到：<pre id="recv">-</pre></p>
+<p id="cmp"></p>
+
+<script>
+'use strict';
+const PORT = 8444;
+const PATH = '/echo';
+const CERT_SHA256_HEX = '6974f8a4a66f7009a10ceba419b7db2340e508e538543037bd6419cc433b2944';
+
+const $ = id => document.getElementById(id);
+
+function setStatus(text, cls) {
+  const el = $('status');
+  el.textContent = text;
+  el.className = cls || '';
+}
+function showError(prefix, e) {
+  const el = $('error');
+  el.hidden = false;
+  const name = e && e.name ? e.name : typeof e;
+  const message = e && e.message ? e.message : String(e);
+  el.textContent = prefix + '\nerror.name: ' + name + '\nerror.message: ' + message;
+  setStatus('錯誤', 'err');
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+function validIPv4(s) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s || '');
+  if (!m) return false;
+  return m.slice(1).every(p => Number(p) >= 0 && Number(p) <= 255);
+}
+
+let transport = null;
+
+async function connect(url) {
+  if (typeof WebTransport === 'undefined') {
+    showError('此瀏覽器不支援 WebTransport', new Error('WebTransport is undefined'));
+    return;
+  }
+  setStatus('連線中...');
+  try {
+    transport = new WebTransport(url, {
+      serverCertificateHashes: [{ algorithm: 'sha-256', value: hexToBytes(CERT_SHA256_HEX) }]
+    });
+    transport.closed.then(
+      () => setStatus('連線已關閉'),
+      e => showError('連線中斷', e)
+    );
+    await transport.ready;
+    setStatus('已連線', 'ok');
+    $('send').disabled = false;
+  } catch (e) {
+    showError('連線失敗', e);
+  }
+}
+
+async function sendEcho() {
+  const text = $('msg').value;
+  $('sent').textContent = text;
+  $('recv').textContent = '...';
+  $('cmp').textContent = '';
+  $('send').disabled = true;
+  try {
+    const stream = await transport.createBidirectionalStream();
+    const writer = stream.writable.getWriter();
+    await writer.write(new TextEncoder().encode(text));
+    await writer.close();
+    const reader = stream.readable.getReader();
+    const dec = new TextDecoder();
+    let got = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got += dec.decode(value, { stream: true });
+    }
+    got += dec.decode();
+    $('recv').textContent = got;
+    const same = got === text;
+    $('cmp').textContent = same ? '相同' : '不相同';
+    $('cmp').className = same ? 'same' : 'diff';
+  } catch (e) {
+    $('recv').textContent = '-';
+    showError('送出失敗', e);
+  } finally {
+    $('send').disabled = false;
+  }
+}
+
+(function main() {
+  const ip = new URLSearchParams(location.search).get('ip');
+  if (!validIPv4(ip)) {
+    $('target').textContent = '-';
+    showError('?ip= 缺少或不是合法 IPv4（例：?ip=172.21.4.115）', new Error('invalid ip: ' + ip));
+    return;
+  }
+  const url = 'https://' + ip + ':' + PORT + PATH;
+  $('target').textContent = url;
+  $('send').addEventListener('click', sendEcho);
+  connect(url);
+})();
+</script>
+</body>
+</html>
