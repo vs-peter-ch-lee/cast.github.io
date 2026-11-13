@@ -1,197 +1,86 @@
 <!doctype html>
 <html lang="zh-Hant">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebTransport 回聲測試</title>
-<style>
-  body { font-family: sans-serif; max-width: 640px; margin: 2em auto; padding: 0 1em; }
-  #status { font-weight: bold; }
-  #status.ok { color: #0a7d2c; }
-  #status.err { color: #b00020; }
-  textarea { width: 100%; box-sizing: border-box; height: 5em; }
-  pre { background: #f4f4f4; padding: .5em; white-space: pre-wrap; word-break: break-all; }
-  .same { color: #0a7d2c; } .diff { color: #b00020; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Casting</title>
+  <meta name="casting-build" content="pages">
+  <link rel="icon" href="favicon.png" type="image/png">
+  <link rel="stylesheet" href="style.css">
 </head>
-<body>
-<h1>WebTransport 回聲測試</h1>
-<p>目標：<code id="target">-</code></p>
-<p>狀態：<span id="status">尚未連線</span></p>
-<pre id="error" hidden></pre>
+<body class="pages">
+  <!-- Icon sprite (VSDS paths, currentColor). -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <symbol id="i-ifp" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M4.99922 4.2002C3.45282 4.2002 2.19922 5.4538 2.19922 7.0002V17.0002C2.19922 18.5466 3.45282 19.8002 4.99922 19.8002H18.9992C20.5456 19.8002 21.7992 18.5466 21.7992 17.0002V7.0002C21.7992 5.4538 20.5456 4.2002 18.9992 4.2002H4.99922ZM3.79922 7.0002C3.79922 6.33745 4.33648 5.8002 4.99922 5.8002H18.9992C19.662 5.8002 20.1992 6.33745 20.1992 7.0002V14.7002H3.79922V7.0002ZM3.79922 16.3002V17.0002C3.79922 17.6629 4.33648 18.2002 4.99922 18.2002H18.9992C19.662 18.2002 20.1992 17.6629 20.1992 17.0002V16.3002H3.79922Z"/></symbol>
+    <symbol id="i-laptop" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" fill="currentColor" d="M6.49922 5.2002C4.95282 5.2002 3.69922 6.4538 3.69922 8.0002V14.0002C3.69922 15.5466 4.95282 16.8002 6.49922 16.8002H17.4992C19.0456 16.8002 20.2992 15.5466 20.2992 14.0002V8.0002C20.2992 6.4538 19.0456 5.2002 17.4992 5.2002H6.49922ZM5.29922 8.0002C5.29922 7.33745 5.83648 6.8002 6.49922 6.8002H17.4992C18.162 6.8002 18.6992 7.33745 18.6992 8.0002V14.0002C18.6992 14.6629 18.162 15.2002 17.4992 15.2002H6.49922C5.83648 15.2002 5.29922 14.6629 5.29922 14.0002V8.0002Z"/><path fill="currentColor" d="M2.99922 18.2002C2.55739 18.2002 2.19922 18.5584 2.19922 19.0002C2.19922 19.442 2.55739 19.8002 2.99922 19.8002H20.9992C21.441 19.8002 21.7992 19.442 21.7992 19.0002C21.7992 18.5584 21.441 18.2002 20.9992 18.2002H2.99922Z"/></symbol>
+  </svg>
 
-<textarea id="msg">hello IFP</textarea>
-<p><button id="send" disabled>送出</button></p>
-<p>送出：<pre id="sent">-</pre></p>
-<p>收到：<pre id="recv">-</pre></p>
-<p id="cmp"></p>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-ifp"/></svg>
+      <h1 data-i18n="title">Casting</h1>
+    </div>
+    <div class="addr"><span data-i18n="addr">IFP 位址</span><code id="ifpAddr"></code></div>
+    <div class="state" id="stateRow" data-state="idle" role="status" aria-live="polite">
+      <span class="dot"></span><span id="status"></span>
+    </div>
+  </header>
 
-<script>
-'use strict';
-const PORT = 8444;
-const PATH = '/echo';
-// Pre-generated certificate batch shared by every IFP (tools/wt-certs/fingerprints.json in the Casting repo):
-// ECDSA P-256, 14 days each, one every 7 days. Only fingerprints and dates; the IFP picks the one valid today.
-const CERTS = [
-  { notBefore: '2026-11-13T00:00:00Z', notAfter: '2026-11-27T00:00:00Z', sha256: '757c5585bbfc1352a2141f7a501ffb32e21932b38db94a80aa05fc7fc1a74844' },
-  { notBefore: '2026-11-20T00:00:00Z', notAfter: '2026-12-04T00:00:00Z', sha256: 'f676c922f05e70ea899f38118d07ef664f91826c7ccbf2ea27eda23f383f7f84' },
-  { notBefore: '2026-11-27T00:00:00Z', notAfter: '2026-12-11T00:00:00Z', sha256: '11191daa647894592efdb93a6968540e8a16326a2a27a99661b90d4409bb8fbb' },
-  { notBefore: '2026-12-04T00:00:00Z', notAfter: '2026-12-18T00:00:00Z', sha256: '09bfb2adaeb9de712ae5e1d9d28c2597972b59a9cad22eb1fd05f30d75a38126' },
-  { notBefore: '2026-12-11T00:00:00Z', notAfter: '2026-12-25T00:00:00Z', sha256: '1d58d013a0704dd1882f32c4d16910fcf04d307b0c950e129dace3b107219a06' },
-  { notBefore: '2026-12-18T00:00:00Z', notAfter: '2027-01-01T00:00:00Z', sha256: 'a35a8e42cc240a2ebe43b0dd61eee00c56e44509df5968e51aa2a768be4e6037' },
-  { notBefore: '2026-12-25T00:00:00Z', notAfter: '2027-01-08T00:00:00Z', sha256: '7a911c6d0895c33ace691dae409e1b1bf6c72aa8cdac2c8912940ce14ceea003' },
-  { notBefore: '2027-01-01T00:00:00Z', notAfter: '2027-01-15T00:00:00Z', sha256: 'd3e85d75a5ae659155d1e7331f275e656a0568c01c5b6dd286ee26c64af692b9' },
-  { notBefore: '2027-01-08T00:00:00Z', notAfter: '2027-01-22T00:00:00Z', sha256: '20974a4e608c7a65f8e2581b9171ffb39325b0ae8c801fff043c6a4c79f7ccf9' },
-  { notBefore: '2027-01-15T00:00:00Z', notAfter: '2027-01-29T00:00:00Z', sha256: '307f2dd2dce425c3726bf2bbd8430dc8b77e638f1384db473c8430838e7ead67' },
-  { notBefore: '2027-01-22T00:00:00Z', notAfter: '2027-02-05T00:00:00Z', sha256: '495f2a2ef1322aeb580f1e24c4e68e9ecaa1eacb7711a9d61b4f38fa0355620b' },
-  { notBefore: '2027-01-29T00:00:00Z', notAfter: '2027-02-12T00:00:00Z', sha256: '5c489e4a977392018ffcf7139ab7466210d5a551d8b220da2e07033a7d342b70' },
-  { notBefore: '2027-02-05T00:00:00Z', notAfter: '2027-02-19T00:00:00Z', sha256: '283d3814d5ef159c14194e74f6509d4916900f61749f6c539b20d4c4bef92022' },
-  { notBefore: '2027-02-12T00:00:00Z', notAfter: '2027-02-26T00:00:00Z', sha256: '47a1d511ead30d646af7f32c88904e1ba38a4849ae37b68f8dd16c0a998db484' },
-  { notBefore: '2027-02-19T00:00:00Z', notAfter: '2027-03-05T00:00:00Z', sha256: 'a9baf6a9e6c0450902e20766aa34755fcec0258350aa8f2188ec6cdf1432af11' },
-  { notBefore: '2027-02-26T00:00:00Z', notAfter: '2027-03-12T00:00:00Z', sha256: 'd336b9aba7e56b4edee883662830ca0a846385da60fd6958572c466750f88644' },
-  { notBefore: '2027-03-05T00:00:00Z', notAfter: '2027-03-19T00:00:00Z', sha256: '5daa78e61e3c8acb0c291c9def26a09f207ea4a849043cac7e8d2d060bf1e01b' },
-  { notBefore: '2027-03-12T00:00:00Z', notAfter: '2027-03-26T00:00:00Z', sha256: 'c9dfb75a2140957c38c15014d28a1bc08c56e5e3a2faf4e2e001eea671fea648' },
-  { notBefore: '2027-03-19T00:00:00Z', notAfter: '2027-04-02T00:00:00Z', sha256: 'd48f183709b4552d864e865769d76996f4a2907b3b03211f6cdbc2f0ba5e93af' },
-  { notBefore: '2027-03-26T00:00:00Z', notAfter: '2027-04-09T00:00:00Z', sha256: '4552061f63a4e3ab7ceb29fab50f0aa4802fabb73bf1820842dd8998a4717f5b' },
-  { notBefore: '2027-04-02T00:00:00Z', notAfter: '2027-04-16T00:00:00Z', sha256: '8dc6b28d85f8bf61010ef77de50a93b410cb805dc4f3ba6f68e1393f8dd296c9' },
-  { notBefore: '2027-04-09T00:00:00Z', notAfter: '2027-04-23T00:00:00Z', sha256: 'fe2141641e86df8b05ce22cab124d239732fa49ecef78a74db2ba88921d0a5b2' },
-  { notBefore: '2027-04-16T00:00:00Z', notAfter: '2027-04-30T00:00:00Z', sha256: '75bcaccb7f5c40227a25aa29d48264137427a7b27fbb717da6965feb09d10d23' },
-  { notBefore: '2027-04-23T00:00:00Z', notAfter: '2027-05-07T00:00:00Z', sha256: '8245c5ed80557d68c3e956a6bcebf6774472c62b13f4345322f962135ae349b5' },
-  { notBefore: '2027-04-30T00:00:00Z', notAfter: '2027-05-14T00:00:00Z', sha256: 'ebe02c6916c5042c3523c7d1b751930fcfa05e1656b3d368df19571008ffd2e1' },
-  { notBefore: '2027-05-07T00:00:00Z', notAfter: '2027-05-21T00:00:00Z', sha256: '03e182557de0ccad377e4c472165c3073959fce77e52b7e58b69a93d7e5f3943' },
-  { notBefore: '2027-05-14T00:00:00Z', notAfter: '2027-05-28T00:00:00Z', sha256: '1f74618dbf1ad75e6fb5655f688bdaaef775eb85df9e29088fb2db645dcb99a0' },
-  { notBefore: '2027-05-21T00:00:00Z', notAfter: '2027-06-04T00:00:00Z', sha256: '8619f6ef9bb49e7f4b3d89c0a9881fc253dc37777655e5c7bc1fd942cb971989' },
-  { notBefore: '2027-05-28T00:00:00Z', notAfter: '2027-06-11T00:00:00Z', sha256: 'f62f0752d1ee11bd26414c58eafbe8d3af6039f0008d1b79574b4787c7f5a3a6' },
-  { notBefore: '2027-06-04T00:00:00Z', notAfter: '2027-06-18T00:00:00Z', sha256: 'ce9e9a7020cb9858b6da35f83e94f9787dcee49201f8608478ce5e4a1078e497' },
-  { notBefore: '2027-06-11T00:00:00Z', notAfter: '2027-06-25T00:00:00Z', sha256: 'fce58a9314e0d8379c1665663ea68dd2bfd5feaf2bf3adab3a72cce67310af1e' },
-  { notBefore: '2027-06-18T00:00:00Z', notAfter: '2027-07-02T00:00:00Z', sha256: 'b0d211c9061f0727f0e4e5e3c9cf6fe32ed6131a984574fa4d4c57a3b5030ab1' },
-  { notBefore: '2027-06-25T00:00:00Z', notAfter: '2027-07-09T00:00:00Z', sha256: '05340282add0dea9d0c940c39b47d1c8372d4054339323ed42d58395b3d6a6e5' },
-  { notBefore: '2027-07-02T00:00:00Z', notAfter: '2027-07-16T00:00:00Z', sha256: 'cb3439588eeaeb2f850f316ab50ea07ccc7fdd6cc3f11a66e1044344c5780b88' },
-  { notBefore: '2027-07-09T00:00:00Z', notAfter: '2027-07-23T00:00:00Z', sha256: '35dea08798bac7c3dc9091824b1a9d57ae254f011637e229ef759718836dfe93' },
-  { notBefore: '2027-07-16T00:00:00Z', notAfter: '2027-07-30T00:00:00Z', sha256: '7a3e41155c1fa0a519bd72779b0aa5dd17f4baf524f86a9155091596c2ea4ddd' },
-  { notBefore: '2027-07-23T00:00:00Z', notAfter: '2027-08-06T00:00:00Z', sha256: '7ae7ba94c16e194a7490e6bbeb3f1e1465e6be35e7b42d2674154b52bc43edef' },
-  { notBefore: '2027-07-30T00:00:00Z', notAfter: '2027-08-13T00:00:00Z', sha256: 'c7b0631e696ac1c2be6eec87908e0cfd4b14481bdc36d71301c6ff7e82b5757e' },
-  { notBefore: '2027-08-06T00:00:00Z', notAfter: '2027-08-20T00:00:00Z', sha256: '9bd100bd731b4f9214c4e778bf3355e6546b58b6c20d8b4c0981fd4a3d348523' },
-  { notBefore: '2027-08-13T00:00:00Z', notAfter: '2027-08-27T00:00:00Z', sha256: 'e4eb2e371b996ae18289fbbb912c986b363ae8ccf73a98b2c2cacb9b89d63dd1' },
-  { notBefore: '2027-08-20T00:00:00Z', notAfter: '2027-09-03T00:00:00Z', sha256: '872fd4b7a6f29031d669b92e2351060e30b7b031c0a4c2f8392ab8c350aeab06' },
-  { notBefore: '2027-08-27T00:00:00Z', notAfter: '2027-09-10T00:00:00Z', sha256: '380ac8d9f12694797c1302f44880905dc482bd621fafdecfee4a25336c6404e1' },
-  { notBefore: '2027-09-03T00:00:00Z', notAfter: '2027-09-17T00:00:00Z', sha256: 'f79843736a12daa261c443f54cb4142dca0f23005e690d1b2abc74672f702777' },
-  { notBefore: '2027-09-10T00:00:00Z', notAfter: '2027-09-24T00:00:00Z', sha256: '4375b125ac72aab140252ce08ca63f94f6654fc16bc53e523d458e211d21b5bf' },
-  { notBefore: '2027-09-17T00:00:00Z', notAfter: '2027-10-01T00:00:00Z', sha256: '6a434adc7dc1c5ce3ccb50b6d4107609e3d8a6dd78064cbcf297ce205c34d492' },
-  { notBefore: '2027-09-24T00:00:00Z', notAfter: '2027-10-08T00:00:00Z', sha256: 'bdda7394f16822eb2ed54a2b2d15f92054c7f62afc8b878a9f06153dccc1f157' },
-  { notBefore: '2027-10-01T00:00:00Z', notAfter: '2027-10-15T00:00:00Z', sha256: 'ca97b5fcbba217ddba95f9a65dd58a0e852d570269cce6e2ab82abcd18a764b3' },
-  { notBefore: '2027-10-08T00:00:00Z', notAfter: '2027-10-22T00:00:00Z', sha256: 'afff5c067d23825c4f046eae130b70397b509e14c0114838e8e1e25ce6f3f730' },
-  { notBefore: '2027-10-15T00:00:00Z', notAfter: '2027-10-29T00:00:00Z', sha256: 'f44534598a02fd275c5898520a547f1a4346a7049f54981cba028358112e3919' },
-  { notBefore: '2027-10-22T00:00:00Z', notAfter: '2027-11-05T00:00:00Z', sha256: '2688251a102c213aba4ad7c1aadb6500a71f42cc0e4cc89f56dc8aa6bc02f541' },
-  { notBefore: '2027-10-29T00:00:00Z', notAfter: '2027-11-12T00:00:00Z', sha256: '7ae19617c13bf595cb20de9974d71f70d32d1df4eded6a01ffc0131419b46112' },
-  { notBefore: '2027-11-05T00:00:00Z', notAfter: '2027-11-19T00:00:00Z', sha256: 'd4025995d2c85ac2672c24bce06bdfb8b174766ba3669607042d81f651d0bb99' },
-  { notBefore: '2027-11-12T00:00:00Z', notAfter: '2027-11-26T00:00:00Z', sha256: '016da202e26d8e506e9e187a7c11799ed13c64ef2b6ae5c413bf60c95129a66e' },
-];
-// Valid right now (overlap periods give 2). Evaluated on every connect, not at page load.
-function currentCertHashes() {
-  const now = Date.now();
-  return CERTS
-    .filter(c => Date.parse(c.notBefore) <= now && now < Date.parse(c.notAfter))
-    .map(c => ({ algorithm: 'sha-256', value: hexToBytes(c.sha256) }));
-}
+  <main class="layout">
 
-const $ = id => document.getElementById(id);
+    <!-- PC -> IFP: side panel (on the Pages build this is the single centered card). -->
+    <aside class="side">
+      <section class="card">
 
-function setStatus(text, cls) {
-  const el = $('status');
-  el.textContent = text;
-  el.className = cls || '';
-}
-function showError(prefix, e) {
-  const el = $('error');
-  el.hidden = false;
-  const name = e && e.name ? e.name : typeof e;
-  const message = e && e.message ? e.message : String(e);
-  el.textContent = prefix + '\nerror.name: ' + name + '\nerror.message: ' + message;
-  setStatus('錯誤', 'err');
-}
-function hexToBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
-}
-function validIPv4(s) {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s || '');
-  if (!m) return false;
-  return m.slice(1).every(p => Number(p) >= 0 && Number(p) <= 255);
-}
+        <!-- Pages build only: laptop -> IFP picture and the idle / casting headline. -->
+        <div class="pages-only pg-hero" aria-hidden="true">
+          <svg class="pg-laptop" viewBox="0 0 24 24"><use href="#i-laptop"/></svg>
+          <svg class="pg-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"/><path d="M14 6l6 6-6 6"/></svg>
+          <svg class="pg-ifp" viewBox="0 0 24 24"><use href="#i-ifp"/></svg>
+        </div>
+        <div class="pages-only pg-text">
+          <h2 class="pg-idle" data-i18n="castTitle">把電腦畫面投到 IFP</h2>
+          <h2 class="pg-casting" data-i18n="castingTitle">正在投放到 IFP</h2>
+          <p class="pg-idle" data-i18n="castLanNote"></p>
+          <p class="pg-casting" data-i18n="castKeepOpen"></p>
+        </div>
 
-let transport = null;
+        <button id="castBtn" class="btn primary" type="button" data-i18n="castBtn">投放到 IFP</button>
+        <button id="stopCastBtn" class="btn stop" type="button" data-i18n="stop" hidden>停止投放</button>
+        <p id="castHint" class="hint" hidden></p>
 
-async function connect(url) {
-  if (typeof WebTransport === 'undefined') {
-    showError('此瀏覽器不支援 WebTransport', new Error('WebTransport is undefined'));
-    return;
-  }
-  setStatus('連線中...');
-  try {
-    const hashes = currentCertHashes();
-    if (hashes.length === 0) {
-      showError('目前時間沒有有效的預埋憑證指紋（清單已過期，需更新測試頁）', new Error('no valid certificate hash at ' + new Date().toISOString()));
-      return;
-    }
-    transport = new WebTransport(url, { serverCertificateHashes: hashes });
-    transport.closed.then(
-      () => setStatus('連線已關閉'),
-      e => showError('連線中斷', e)
-    );
-    await transport.ready;
-    setStatus('已連線', 'ok');
-    $('send').disabled = false;
-  } catch (e) {
-    showError('連線失敗', e);
-  }
-}
+        <!-- PIN gate for casting only: shown when casting is requested without a valid session cookie. -->
+        <form id="pinView" class="pin" hidden>
+          <label for="pinInput" data-i18n="pinLabel">IFP 上顯示的 6 位數 PIN</label>
+          <input id="pinInput" inputmode="numeric" autocomplete="off" maxlength="6" pattern="[0-9]{6}" size="8">
+          <div id="pinError"></div>
+          <button id="pinBtn" class="btn primary" type="submit" data-i18n="pinOk">開始投放</button>
+          <button id="pinCancelBtn" class="btn quiet" type="button" data-i18n="pinCancel">取消</button>
+        </form>
 
-async function sendEcho() {
-  const text = $('msg').value;
-  $('sent').textContent = text;
-  $('recv').textContent = '...';
-  $('cmp').textContent = '';
-  $('send').disabled = true;
-  try {
-    const stream = await transport.createBidirectionalStream();
-    const writer = stream.writable.getWriter();
-    await writer.write(new TextEncoder().encode(text));
-    await writer.close();
-    const reader = stream.readable.getReader();
-    const dec = new TextDecoder();
-    let got = '';
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      got += dec.decode(value, { stream: true });
-    }
-    got += dec.decode();
-    $('recv').textContent = got;
-    const same = got === text;
-    $('cmp').textContent = same ? '相同' : '不相同';
-    $('cmp').className = same ? 'same' : 'diff';
-  } catch (e) {
-    $('recv').textContent = '-';
-    showError('送出失敗', e);
-  } finally {
-    $('send').disabled = false;
-  }
-}
+        <div class="pages-only pg-note pg-idle">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.5v.5"/></svg>
+          <span data-i18n="lanPermission"></span>
+        </div>
 
-(function main() {
-  const ip = new URLSearchParams(location.search).get('ip');
-  if (!validIPv4(ip)) {
-    $('target').textContent = '-';
-    showError('?ip= 缺少或不是合法 IPv4（例：?ip=172.21.4.115）', new Error('invalid ip: ' + ip));
-    return;
-  }
-  const url = 'https://' + ip + ':' + PORT + PATH;
-  $('target').textContent = url;
-  $('send').addEventListener('click', sendEcho);
-  connect(url);
-})();
-</script>
+      </section>
+
+      <details id="advanced" class="advanced">
+        <summary data-i18n="advanced">進階設定</summary>
+        <div class="diag-title" data-i18n="diag">診斷資訊</div>
+        <div id="castStats" class="stats"></div>
+      </details>
+    </aside>
+
+    <!-- Pages build only: where to watch the IFP screen. The link is filled in by app.js from ?ip=. -->
+    <p id="viewRow" class="pages-only pg-foot" hidden><span data-i18n="viewPre"></span><a id="viewLink" href="#"></a></p>
+  </main>
+
+  <script src="common.js"></script>
+  <script src="fingerprints.js"></script>
+  <script src="wt.js"></script>
+  <script src="rtccast.js"></script>
+  <script src="app.js"></script>
 </body>
 </html>
