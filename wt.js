@@ -12,7 +12,11 @@ const Wt = (() => {
   const PORT = 8444;
   const PATH = '/cast';
   const CERT_VALID_MS = 14 * 24 * 3600 * 1000; // Chrome only accepts hash-pinned certificates valid for <= 14 days
-  const CONNECT_TIMEOUT_MS = 8000;
+  // Chrome asks "Access other devices on your local network" on the first connect and keeps `ready` pending until
+  // the user answers, so this must outlast a person reading the prompt. An unreachable IFP normally makes Chrome
+  // reject `ready` by itself well before this; the value only bounds the case where it never settles.
+  const CONNECT_TIMEOUT_MS = 90000;
+  // Per request on an already established session (counted from session ready, not from the connect).
   const REQUEST_TIMEOUT_MS = 10000;
   const PING_MS = 15000;
   const MAX_REPLY_BYTES = 1 << 20;

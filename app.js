@@ -16,7 +16,7 @@
     receiveIdle: $('receiveIdle'), receiveWrap: $('receiveWrap'), receiveStage: $('receiveStage'), receiveVideo: $('receiveVideo'),
     unmuteBtn: $('unmuteBtn'), fullscreenBtn: $('fullscreenBtn'),
     status: $('status'), stateRow: $('stateRow'), ifpAddr: $('ifpAddr'),
-    pinView: $('pinView'), pinInput: $('pinInput'), pinError: $('pinError'), pinCancelBtn: $('pinCancelBtn'),
+    pinView: $('pinView'), pinInput: $('pinInput'), pinError: $('pinError'), pinCancelBtn: $('pinCancelBtn'), pinBtn: $('pinBtn'),
     castDesc: $('castDesc'), castLegacyRow: $('castLegacyRow'), castLegacy: $('castLegacy'),
     viewRow: $('viewRow'), viewLink: $('viewLink'),
   };
@@ -199,6 +199,7 @@
     return r.ok;
   }
 
+  let loginSeq = 0; // bumped by every submit and by cancel; a stale login result is ignored
   ui.pinView.onsubmit = async (ev) => {
     ev.preventDefault();
     const pin = ui.pinInput.value.trim();
@@ -206,20 +207,38 @@
       ui.pinError.textContent = t('pinInvalid');
       return;
     }
+    // WebTransport can wait a long time here (the browser's local-network permission prompt): show progress.
+    const seq = ++loginSeq;
+    const okLabel = ui.pinBtn.textContent;
+    ui.pinBtn.disabled = true;
+    ui.pinBtn.textContent = t('connecting');
+    ui.pinError.textContent = '';
     try {
-      if (await login(pin)) {
+      const ok = await login(pin);
+      if (seq !== loginSeq) return; // cancelled while waiting
+      if (ok) {
         authed = true;
         hidePin();
-        startCast();
+        // Screen capture needs a fresh click. A long wait (permission prompt) can use it up: ask for one more click.
+        if (wtMode && navigator.userActivation && !navigator.userActivation.isActive) {
+          setStatus(t('connectedClickCast'));
+          ui.castBtn.focus();
+        } else {
+          startCast();
+        }
       } else {
         ui.pinError.textContent = t('pinWrong');
         ui.pinInput.select();
       }
     } catch (e) {
+      if (seq !== loginSeq) return;
       ui.pinError.textContent = (wtMode && e && e.message) || t('connectFail');
+    } finally {
+      ui.pinBtn.disabled = false;
+      ui.pinBtn.textContent = okLabel;
     }
   };
-  ui.pinCancelBtn.onclick = () => hidePin();
+  ui.pinCancelBtn.onclick = () => { loginSeq++; hidePin(); };
 
   // The PIN may rotate at any time (manual, idle timeout): poll so the page returns to the PIN form.
   // Not in WebTransport mode: an unauthorized invite sends the page back to the PIN form instead.
