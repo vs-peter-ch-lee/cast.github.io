@@ -208,8 +208,6 @@ h2 { font-size: 18px; font-weight: 700; line-height: 1.4; margin: 0; }
 .btn:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible { outline: 3px solid var(--brand); outline-offset: 2px; }
 .hint { font-size: 14px; line-height: 1.6; color: var(--warn); margin: 0; }
 .hint.info { color: var(--receive-hint); }
-.note-text { margin: 0; font-size: 14px; line-height: 1.6; color: var(--muted); }
-.note-text.legacy { border-top: 1px solid var(--line); padding-top: 16px; }
 
 /* PIN form: label, big input, submit, quiet cancel. */
 .pin { display: flex; flex-direction: column; gap: 12px; margin: 0; }
@@ -285,7 +283,10 @@ body.pages .pg-note {
   line-height: 1.6;
 }
 body.pages .pg-note svg { width: 20px; height: 20px; flex: none; margin-top: 2px; color: var(--note-icon); }
-body.pages .pg-foot { display: block; margin: 16px 0 0; font-size: 12px; line-height: 1.6; color: var(--muted); }
+/* The receive area sits above the card, in the same column. */
+body.pages .layout { gap: 24px; }
+body.pages .receive { flex: none; width: 100%; max-width: 960px; }
+body.pages .receive-idle { min-height: 0; padding: 32px 24px; }
 /* Diagnostics sit at the bottom of the card, and only while casting. */
 body.pages .advanced { margin-top: 24px; padding: 12px 0 0; border-top: 1px solid var(--line); }
 body.pages .advanced summary { padding: 0; }
@@ -294,8 +295,13 @@ body.pages:not([data-state="casting"]) .advanced { display: none; }
 .pg-casting { display: none; }
 body.pages[data-state="casting"] .pg-hero { color: var(--ok-icon); }
 body.pages[data-state="casting"] .pg-arrow { color: var(--ok-icon); }
-body.pages[data-state="casting"] .pg-idle, body.pages[data-state="casting"] .pg-foot { display: none; }
+body.pages[data-state="casting"] .pg-idle { display: none; }
 body.pages[data-state="casting"] .pg-casting { display: block; }
+
+/* IFP entry page (portal.html on :8080): one card with a single button. */
+.portal { flex: 1; display: flex; align-items: center; justify-content: center; padding: 32px 16px; }
+.portal-card { width: 100%; max-width: 480px; padding: 32px; gap: 24px; text-align: center; }
+.portal-card p { margin: 0; font-size: 14px; line-height: 1.6; color: var(--muted); }
 
 /* Narrow screens: one column, receive area first. */
 @media (max-width: 900px) {

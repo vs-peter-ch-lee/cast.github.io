@@ -1,6 +1,7 @@
-// PC -> IFP over WebRTC (WHIP-style, non-trickle): POST /rtc/whip?w=&h= with offer, 201 + answer.
-// Signaling is pluggable: the default is the HTTP WHIP above; wt.js supplies the same invite/end pair over
-// WebTransport (ctx.signaling). The media path is identical either way.
+// PC -> IFP over WebRTC (non-trickle). Signaling is injected (ctx.signaling): wt.js supplies the invite/end pair over
+// WebTransport.
+//   invite(w, h, sdp, onId) -> {ok, status, id, sdp}; onId(id) fires as soon as the id is known. end(id) releases it.
+// A 'meeting' DataChannel carries the IFP's end-of-meeting notice.
 'use strict';
 
 const RtcCast = (() => {
@@ -28,29 +29,6 @@ const RtcCast = (() => {
     transceiver.setCodecPreferences([...mode1, ...h264.filter((c) => !mode1.includes(c)), ...rest]);
   }
 
-  /**
-   * Default signaling: HTTP WHIP on the page's own origin (cookie auth).
-   * invite(w, h, sdp, onId) -> {ok, status, id, sdp}; onId(id) fires as soon as the id is known. end(id) releases it.
-   */
-  const HTTP_SIGNALING = {
-    async invite(w, h, sdp, onId) {
-      const resp = await fetch(`/rtc/whip?w=${w}&h=${h}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/sdp' },
-        credentials: 'same-origin',
-        body: sdp,
-      });
-      const ok = resp.status === 201;
-      const id = ok ? resp.headers.get('Location') : null;
-      if (ok && onId) onId(id);
-      return { ok, status: resp.status, id, sdp: await resp.text() };
-    },
-    async end(id) {
-      const res = await fetch(id, { method: 'DELETE', credentials: 'same-origin' });
-      log(`DELETE -> ${res.status}`);
-    },
-  };
-
   /** Resolves when [p] settles (either way) or after [ms], whichever comes first. */
   function settleWithin(p, ms) {
     return new Promise((resolve) => {
@@ -61,8 +39,8 @@ const RtcCast = (() => {
 
   /**
    * Ends the run exactly once. text = status passed to onEnded; null = no notification (caller already
-   * handles it). Order: DELETE the IFP-side session and wait for the reply (max DELETE_WAIT_MS), then
-   * pc.close() and stop capture. The UI is notified at once. DELETE of a replaced id answering 404 is normal.
+   * handles it). Order: release the IFP-side session with sig.end(id) and wait for the reply (max DELETE_WAIT_MS),
+   * then pc.close() and stop capture. The UI is notified at once. After the end-of-meeting notice nothing is released.
    */
   async function finish(r, reason, text) {
     if (r.finished) return;
@@ -73,9 +51,10 @@ const RtcCast = (() => {
     if (run === r) run = null;
     if (text !== null) r.ctx.onEnded(text);
     try {
-      // POST still in flight: its answer carries the id we need to release.
-      if (!r.id && r.posting) await settleWithin(r.posting, DELETE_WAIT_MS);
-      if (r.id) {
+      // POST still in flight: its answer carries the id we need to release. After the end-of-meeting notice
+      // there is nothing to release (the IFP already dropped it, and would answer no_meeting).
+      if (!r.meetingEnded && !r.id && r.posting) await settleWithin(r.posting, DELETE_WAIT_MS);
+      if (r.id && !r.meetingEnded) {
         log(`end ${r.id}`);
         r.deleteSent = true;
         await settleWithin(r.sig.end(r.id), DELETE_WAIT_MS);
@@ -145,14 +124,14 @@ const RtcCast = (() => {
     r.ctx.stats.textContent = line;
   }
 
-  /** ctx: { stats: element, onEnded(text), signaling?: {invite, end} (default HTTP WHIP) }. Resolves once the POST/answer exchange is done; rejects Error(text) on failure. */
+  /** ctx: { stats: element, onEnded(text), onMeetingEnded(), signaling: {invite, end} }. Resolves once the POST/answer exchange is done; rejects Error(text) on failure. */
   async function start(ctx) {
     if (run) return;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
       throw new Error('此瀏覽器不支援分享畫面');
     }
     const r = {
-      ctx, sig: ctx.signaling || HTTP_SIGNALING, t0: performance.now(),
+      ctx, sig: ctx.signaling, t0: performance.now(),
       finished: false, id: null, pc: null, stream: null, last: null,
     };
     run = r;
@@ -200,6 +179,13 @@ const RtcCast = (() => {
       vp.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
       await vSender.setParameters(vp);
       if (audioTrack) pc.addTrack(audioTrack, r.stream);
+      const meeting = pc.createDataChannel('meeting');
+      meeting.onmessage = (e) => {
+        if (!isMeetingEnded(e.data) || r.finished) return;
+        r.meetingEnded = true;
+        finish(r, 'meeting ended', null);
+        ctx.onMeetingEnded();
+      };
       const vTrans = pc.getTransceivers().find((t) => t.sender === vSender);
       if (vTrans) preferH264(vTrans);
 
@@ -234,7 +220,7 @@ const RtcCast = (() => {
       const res = await r.posting;
       if (r.finished) {
         // Ended while the invite was in flight and finish() stopped waiting for it: release the IFP side now.
-        if (r.id && r.deleteDone && !r.deleteSent) {
+        if (r.id && r.deleteDone && !r.deleteSent && !r.meetingEnded) {
           r.sig.end(r.id).catch(() => {});
         }
         return;

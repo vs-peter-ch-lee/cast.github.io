@@ -1,11 +1,12 @@
-// Page wiring: two main buttons, diagnostics, status line, PIN gate for casting.
+// Page wiring: two main buttons, diagnostics, status line, PIN gate for casting and watching.
 // Direction logic lives in whep.js (IFP -> PC) and rtccast.js (PC -> IFP), both WebRTC.
 //
-// Three ways this one script runs:
-//   - IFP page (:8080 entry, :8443 casting): handshake over fetch ('/api/session', '/api/login', '/rtc/whip').
-//   - GitHub Pages build with ?ip=<IFP IPv4> (wt.js): handshake over WebTransport, PIN token kept in memory only.
-//   - GitHub Pages build without ?ip=: only a hint to start from the IFP entry page.
-// The Pages build has no viewing UI (receive*, castDesc, castLegacy elements are removed from its index.html).
+// This page is only served from GitHub Pages and talks to one IFP over WebTransport (wt.js), chosen by ?ip=<IFP IPv4>
+// (the IFP's :8080 entry page links here). The PIN token is kept in memory only. On load the page pings the IFP:
+// when it cannot be reached (no meeting: the IFP does not listen) or reports no meeting, everything is disabled and it shows the "cannot reach" text (no automatic retry, reload to check again).
+// The same text is shown when the IFP becomes unreachable while the page is in use (login, cast or watch start fails to connect);
+// a "Meeting ended" text already shown is never replaced.
+// Both directions need a PIN login first.
 'use strict';
 
 (() => {
@@ -17,62 +18,54 @@
     unmuteBtn: $('unmuteBtn'), fullscreenBtn: $('fullscreenBtn'),
     status: $('status'), stateRow: $('stateRow'), ifpAddr: $('ifpAddr'),
     pinView: $('pinView'), pinInput: $('pinInput'), pinError: $('pinError'), pinCancelBtn: $('pinCancelBtn'), pinBtn: $('pinBtn'),
-    castDesc: $('castDesc'), castLegacyRow: $('castLegacyRow'), castLegacy: $('castLegacy'),
-    viewRow: $('viewRow'), viewLink: $('viewLink'),
   };
-  const SESSION_POLL_MS = 5000;
   let receiving = false;
   let casting = false;
 
   // ---- mode ---------------------------------------------------------------------------------
-  const pagesBuild = !!document.querySelector('meta[name="casting-build"][content="pages"]');
   const query = new URLSearchParams(location.search);
-  const wtMode = query.has('ip'); // ?ip= present: WebTransport handshake with that IFP
-  const wtIp = wtMode && typeof Wt !== 'undefined' ? Wt.parseIp(query.get('ip')) : null; // null = invalid
-  const legacyApi = !wtMode && !pagesBuild; // fetch handshake against the page's own IFP origin
+  const wtMode = query.has('ip');
+  const wtIp = wtMode ? Wt.parseIp(query.get('ip')) : null; // null = missing or invalid
   if (wtIp) Wt.init(wtIp);
 
   // ---- static text / environment ------------------------------------------------------------
   document.documentElement.lang = LANG === 'en' ? 'en' : 'zh-Hant';
   document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
   document.querySelectorAll('[data-i18n-alt]').forEach((el) => { el.alt = t(el.dataset.i18nAlt); });
-  if (wtMode) ui.ifpAddr.textContent = wtIp || '';
-  else ui.ifpAddr.textContent = pagesBuild ? '' : location.host;
-  // The HTTP portal (:8080) has no screen capture and no PIN cookie: casting continues on the HTTPS page.
-  const onHttps = location.protocol === 'https:';
+  ui.ifpAddr.textContent = wtIp || '';
   const canCast = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-  // The cast description and the old-https link (with its certificate-warning note) belong to the HTTP entry page:
-  // on HTTPS the user is already past the warning.
-  if (ui.castDesc) {
-    ui.castDesc.textContent = t('castDesc', new URL(PAGES_URL).host);
-    ui.castDesc.hidden = onHttps || !legacyApi;
-  }
-  if (ui.castLegacyRow) {
-    ui.castLegacyRow.hidden = onHttps || !legacyApi;
-    ui.castLegacy.href = `https://${location.hostname}:${HTTPS_PORT}/#cast`;
-  }
-  // Pages build: link to the IFP entry page, where the screen can be watched.
-  if (ui.viewRow && wtIp) {
-    ui.viewLink.href = ui.viewLink.textContent = `http://${wtIp}:8080`;
-    ui.viewRow.hidden = false;
-  }
-  /** Casting is impossible here: show [text] and disable the cast button. */
-  function blockCast(text) {
-    ui.castBtn.disabled = true;
+  if (ui.fullscreenBtn && !document.fullscreenEnabled) ui.fullscreenBtn.hidden = true;
+
+  // ---- controls -----------------------------------------------------------------------------
+  let fatalText = '';
+  if (!wtMode) fatalText = t('needIfpEntry');
+  else if (!wtIp) fatalText = t('badIp');
+  else if (typeof WebTransport === 'undefined') fatalText = t('noWebTransport');
+  let blockedText = ''; // no meeting / meeting ended: everything stays disabled until the page is reloaded
+  let checking = false;
+
+  function showHint(text) {
     ui.castHint.textContent = text;
     ui.castHint.hidden = false;
   }
-  if (wtMode && !wtIp) blockCast(t('badIp'));
-  else if (pagesBuild && !wtMode) blockCast(t('needIfpEntry'));
-  else if (wtMode && typeof WebTransport === 'undefined') blockCast(t('noWebTransport'));
-  else if (onHttps && !canCast) blockCast(t('noDisplayMedia'));
-  const wtReady = wtMode && !!wtIp && !ui.castBtn.disabled;
-  if (ui.fullscreenBtn && !document.fullscreenEnabled) ui.fullscreenBtn.hidden = true;
+
+  function applyControls() {
+    const locked = !!fatalText || !!blockedText || checking;
+    ui.receiveBtn.disabled = locked;
+    ui.castBtn.disabled = locked || !canCast;
+  }
+
+  if (fatalText) showHint(fatalText);
+  else if (!canCast) showHint(t('noDisplayMedia'));
+  applyControls();
 
   // ---- status line --------------------------------------------------------------------------
   let message = '';
   function renderStatus() {
-    if (message) {
+    if (blockedText) {
+      ui.status.textContent = blockedText;
+      ui.stateRow.dataset.state = 'notice';
+    } else if (message) {
       ui.status.textContent = message;
       ui.stateRow.dataset.state = 'notice';
     } else if (casting) {
@@ -91,7 +84,6 @@
   function setStatus(text) { message = text || ''; renderStatus(); }
 
   function setReceiving(on) {
-    if (!ui.receiveBtn) return; // Pages build: no viewing UI
     receiving = on;
     ui.receiveIdle.hidden = on;
     ui.stopReceiveBtn.hidden = !on;
@@ -111,11 +103,9 @@
     ui.castBtn.hidden = on;
     ui.stopCastBtn.hidden = !on;
     if (!on) ui.castStats.textContent = '';
-    if (wtMode) {
-      // Keep the IFP-side handshake alive while casting; a dropped connection does not end the cast.
-      if (on) Wt.startKeepalive();
-      else Wt.stopKeepalive();
-    }
+    // Keep the IFP-side handshake alive while casting; a dropped connection does not end the cast.
+    if (on) Wt.startKeepalive();
+    else Wt.stopKeepalive();
     renderStatus();
   }
 
@@ -133,73 +123,89 @@
     setStatus(reasonText);
   }
 
-  if (ui.receiveBtn) {
-    ui.unmuteBtn.onclick = () => {
-      ui.receiveVideo.muted = false;
-      ui.receiveVideo.play().catch(() => {});
-      ui.unmuteBtn.hidden = true;
-    };
-    ui.fullscreenBtn.onclick = () => {
-      if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-      else ui.receiveStage.requestFullscreen().catch(() => {});
-    };
-  }
+  ui.unmuteBtn.onclick = () => {
+    ui.receiveVideo.muted = false;
+    ui.receiveVideo.play().catch(() => {});
+    ui.unmuteBtn.hidden = true;
+  };
+  ui.fullscreenBtn.onclick = () => {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else ui.receiveStage.requestFullscreen().catch(() => {});
+  };
 
-  // ---- PIN gate (casting only) -------------------------------------------------------------
-  let authed = false;
+  // ---- PIN gate (casting and watching) -----------------------------------------------------
+  let pinAction = null; // 'cast' | 'receive': what to start once the PIN is accepted
 
-  /** true = cookie valid, false = 401, null = IFP unreachable. */
-  async function checkSession() {
-    try {
-      const r = await fetch('/api/session', { cache: 'no-store', credentials: 'same-origin' });
-      return r.ok;
-    } catch (e) {
-      return null;
+  /** Shows the PIN form for [action]. Casting is stopped for 'cast' only; nothing is shown once the meeting is over. */
+  function showPin(errorText, action) {
+    if (blockedText) return;
+    pinAction = action;
+    if (action === 'cast') {
+      endCast('');
+      ui.castBtn.hidden = true;
     }
-  }
-
-  /** Stops casting and shows the PIN form. Receiving is not touched. */
-  function showPin(errorText) {
-    authed = false;
-    endCast('');
-    ui.castBtn.hidden = true;
     ui.pinView.hidden = false;
     ui.pinError.textContent = errorText || '';
     ui.pinInput.value = '';
+    ui.pinView.scrollIntoView({ block: 'nearest' });
     ui.pinInput.focus();
   }
 
   function hidePin() {
+    pinAction = null;
     ui.pinView.hidden = true;
     ui.pinError.textContent = '';
     ui.castBtn.hidden = casting;
   }
 
-  /**
-   * After a failed cast start: if the login is no longer valid, go back to the PIN form.
-   * WebTransport mode: an 'unauthorized' invite already dropped the in-memory token.
-   */
-  async function recheckAuth() {
-    if (wtMode) {
-      if (!Wt.hasToken()) showPin(t('pinChanged'));
-      return;
+  /** The IFP has no meeting (never started, ended) or cannot be reached: show [text], hide the PIN form, disable the controls. Media is not touched here. */
+  function setNoMeeting(text) {
+    blockedText = text;
+    loginSeq++;
+    hidePin();
+    showHint(text);
+    applyControls();
+    renderStatus();
+  }
+  // A no_meeting reply never replaces a text already shown (e.g. "Meeting ended" from the notice).
+  Wt.onNoMeeting(markUnreachable);
+
+  /** The IFP cannot be reached while the page is in use (login, cast, watch): same screen as on load, unless a text is already shown. */
+  function markUnreachable() { if (!blockedText) setNoMeeting(t('unreachable')); }
+  function isConnectFail(e) { return !!e && e.message === t('connectFail'); }
+  /** Wraps a Wt signaling call so that a connection failure also shows the "cannot reach" screen, then rethrows. */
+  function watchUnreachable(fn) {
+    return async (...args) => {
+      try {
+        return await fn(...args);
+      } catch (e) {
+        if (isConnectFail(e)) markUnreachable();
+        throw e;
+      }
+    };
+  }
+  const castSignaling = { invite: watchUnreachable(Wt.signaling.invite), end: Wt.signaling.end };
+  const viewSignaling = { view: watchUnreachable(Wt.viewSignaling.view), end: Wt.viewSignaling.end };
+
+  /** The IFP sent its end-of-meeting notice over a 'meeting' DataChannel: stop watching and casting. */
+  function meetingEnded() {
+    if (receiving) {
+      Whep.stop();
+      setReceiving(false);
     }
-    if ((await checkSession()) === false) showPin(t('pinChanged'));
+    if (casting) {
+      RtcCast.stop();
+      setCasting(false);
+    }
+    setNoMeeting(t('meetingEnded'));
   }
 
-  /** true = PIN accepted, false = wrong PIN; throws when the IFP cannot be reached. */
-  async function login(pin) {
-    if (wtMode) return (await Wt.login(pin)).ok;
-    const r = await fetch('/api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
-      body: JSON.stringify({ pin }),
-    });
-    return r.ok;
+  /** After a failed cast start: if the login is no longer valid (an unauthorized invite dropped the token), ask again. */
+  function recheckAuth() {
+    if (!Wt.hasToken()) showPin(t('pinChanged'), 'cast');
   }
 
-  let loginSeq = 0; // bumped by every submit and by cancel; a stale login result is ignored
+  let loginSeq = 0; // bumped by every submit, by cancel and by no-meeting; a stale login result is ignored
   ui.pinView.onsubmit = async (ev) => {
     ev.preventDefault();
     const pin = ui.pinInput.value.trim();
@@ -214,13 +220,15 @@
     ui.pinBtn.textContent = t('connecting');
     ui.pinError.textContent = '';
     try {
-      const ok = await login(pin);
+      const ok = (await Wt.login(pin)).ok;
       if (seq !== loginSeq) return; // cancelled while waiting
       if (ok) {
-        authed = true;
+        const action = pinAction;
         hidePin();
-        // Screen capture needs a fresh click. A long wait (permission prompt) can use it up: ask for one more click.
-        if (wtMode && navigator.userActivation && !navigator.userActivation.isActive) {
+        if (action === 'receive') {
+          startReceive();
+        } else if (navigator.userActivation && !navigator.userActivation.isActive) {
+          // Screen capture needs a fresh click. A long wait (permission prompt) can use it up: ask for one more click.
           setStatus(t('connectedClickCast'));
           ui.castBtn.focus();
         } else {
@@ -232,7 +240,8 @@
       }
     } catch (e) {
       if (seq !== loginSeq) return;
-      ui.pinError.textContent = (wtMode && e && e.message) || t('connectFail');
+      if (isConnectFail(e)) markUnreachable();
+      else ui.pinError.textContent = (e && e.message) || t('connectFail');
     } finally {
       ui.pinBtn.disabled = false;
       ui.pinBtn.textContent = okLabel;
@@ -240,48 +249,53 @@
   };
   ui.pinCancelBtn.onclick = () => { loginSeq++; hidePin(); };
 
-  // The PIN may rotate at any time (manual, idle timeout): poll so the page returns to the PIN form.
-  // Not in WebTransport mode: an unauthorized invite sends the page back to the PIN form instead.
-  if (legacyApi) {
-    setInterval(async () => {
-      if (authed && (await checkSession()) === false) showPin(t('pinChanged'));
-    }, SESSION_POLL_MS);
+  // ---- meeting check on load ----------------------------------------------------------------
+  async function checkMeeting() {
+    checking = true;
+    applyControls();
+    setStatus(t('connecting'));
+    try {
+      const res = await Wt.ping();
+      setStatus('');
+      if (res.meeting === false) markUnreachable();
+    } catch (e) {
+      if (isConnectFail(e)) markUnreachable();
+      else setStatus((e && e.message) || t('connectFail'));
+    } finally {
+      checking = false;
+      applyControls();
+    }
   }
-
-  if (wtReady) {
-    // Arrived from the IFP entry page's cast button: ask for the PIN right away (the token is memory-only,
-    // so there is never a session to reuse after a load).
-    if (canCast) showPin('');
-  } else if (legacyApi && onHttps) {
-    checkSession().then((ok) => {
-      authed = ok === true;
-      // Arrived from the HTTP portal's cast button: ask for the PIN right away. With a valid cookie the
-      // user clicks the cast button once more, because screen capture only starts from a click.
-      if (location.hash !== '#cast') return;
-      history.replaceState(null, '', location.pathname);
-      if (ok === false && canCast && !casting) showPin('');
-      else ui.castBtn.focus();
-    });
-  }
+  if (!fatalText) checkMeeting();
 
   // ---------------------------------------------------------------------------------------
 
-  if (ui.receiveBtn) {
-    ui.receiveBtn.onclick = async () => {
-      setStatus('');
-      setReceiving(true);
-      try {
-        await Whep.start({
-          stats: ui.receiveStats,
-          video: ui.receiveVideo,
-          onEnded: (text) => endReceive(text),
-        });
-      } catch (e) {
-        endReceive(tMsg(e.message || String(e)));
+  async function startReceive() {
+    setStatus('');
+    setReceiving(true);
+    try {
+      await Whep.start({
+        stats: ui.receiveStats,
+        video: ui.receiveVideo,
+        signaling: viewSignaling,
+        onEnded: (text) => endReceive(text),
+        onMeetingEnded: meetingEnded,
+      });
+    } catch (e) {
+      if (e && e.code === 'unauthorized') {
+        endReceive('');
+        showPin(t('pinChanged'), 'receive');
+      } else {
+        endReceive(tMsg((e && e.message) || String(e)));
       }
-    };
-    ui.stopReceiveBtn.onclick = () => endReceive('');
+    }
   }
+
+  ui.receiveBtn.onclick = () => {
+    if (Wt.hasToken()) startReceive();
+    else showPin(t('pinRequired'), 'receive');
+  };
+  ui.stopReceiveBtn.onclick = () => endReceive('');
 
   async function startCast() {
     setStatus('');
@@ -290,31 +304,18 @@
       await RtcCast.start({
         stats: ui.castStats,
         onEnded: (text) => endCast(tMsg(text)),
-        signaling: wtMode ? Wt.signaling : undefined,
+        onMeetingEnded: meetingEnded,
+        signaling: castSignaling,
       });
     } catch (e) {
-      endCast(tMsg(e.message || String(e)));
+      endCast(tMsg((e && e.message) || String(e)));
       recheckAuth();
     }
   }
 
-  ui.castBtn.onclick = async () => {
-    if (wtMode) {
-      if (Wt.hasToken()) startCast();
-      else showPin('');
-      return;
-    }
-    if (!onHttps) {
-      // HTTP entry page: casting continues on the Pages build, which then talks to this IFP over WebTransport.
-      location.href = `${PAGES_URL}?ip=${location.hostname}`;
-      return;
-    }
-    if (!authed) authed = (await checkSession()) === true;
-    if (!authed) {
-      showPin('');
-      return;
-    }
-    startCast();
+  ui.castBtn.onclick = () => {
+    if (Wt.hasToken()) startCast();
+    else showPin('', 'cast');
   };
   ui.stopCastBtn.onclick = () => endCast('');
 

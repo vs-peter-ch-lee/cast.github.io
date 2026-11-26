@@ -4,7 +4,11 @@
 //   {"type":"login","pin":"123456"}                          -> {"ok":true,"token":"<hex>"} | {"ok":false,"error":"wrong_pin"}
 //   {"type":"invite","token","w","h","sdp":"<offer>"}        -> {"ok":true,"id","sdp":"<answer>"} | {"ok":false,"error":"unauthorized"|"failed"}
 //   {"type":"end","token","id"}                              -> {"ok":true} | {"ok":false,"error":"unauthorized"|"not_found"}
-//   {"type":"ping"}                                          -> {"ok":true}
+//   {"type":"view","token","sdp":"<offer>"}                  -> {"ok":true,"id","sdp":"<answer>"} | {"ok":false,"error":"unauthorized"|"failed"|"bad_request"}
+//   {"type":"view-end","token","id"}                         -> {"ok":true} | {"ok":false,"error":"unauthorized"|"not_found"|"bad_request"}
+//   {"type":"ping"}                                          -> {"ok":true,"meeting":<bool>}   (no token needed)
+// Without a meeting, login / invite / end / view / view-end answer {"ok":false,"error":"no_meeting"}: request() drops the
+// token and calls the handler given to onNoMeeting.
 // The login token lives only in this closure (never in storage, cookie or URL): a reload asks for the PIN again.
 'use strict';
 
@@ -32,6 +36,7 @@ const Wt = (() => {
   let connecting = null; // Promise of the session being opened
   let pingTimer = null;
   let pinging = false;
+  let noMeetingHandler = null;
 
   /** Dotted-quad IPv4 (each part 0-255, no leading zeros) -> normalized string, else null. */
   function parseIp(text) {
@@ -121,8 +126,9 @@ const Wt = (() => {
   async function request(obj) {
     const wt = await ensureSession();
     let timer;
+    let res;
     try {
-      return await Promise.race([
+      res = await Promise.race([
         exchange(wt, obj),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('request timeout')), REQUEST_TIMEOUT_MS); }),
       ]);
@@ -134,6 +140,16 @@ const Wt = (() => {
     } finally {
       clearTimeout(timer);
     }
+    if (res.error === 'no_meeting') {
+      token = null;
+      if (noMeetingHandler) noMeetingHandler();
+    }
+    return res;
+  }
+
+  /** Resolves the ping reply {ok, meeting}; throws when the IFP cannot be reached. */
+  function ping() {
+    return request({ type: 'ping' });
   }
 
   /** Resolves {ok:true} (token kept in memory) or {ok:false, error:'wrong_pin'}; throws when unreachable. */
@@ -147,7 +163,7 @@ const Wt = (() => {
     throw new Error(t('connectFail'));
   }
 
-  // Signaling for RtcCast (same shape as its HTTP default): invite(w, h, sdp, onId) / end(id).
+  // Signaling for RtcCast: invite(w, h, sdp, onId) / end(id).
   const signaling = {
     async invite(w, h, sdp, onId) {
       if (!token) return { ok: false, status: 'unauthorized' };
@@ -164,6 +180,25 @@ const Wt = (() => {
       const res = await request({ type: 'end', token, id });
       if (res.error === 'unauthorized') token = null;
       console.log(`[wt] end -> ${res.ok ? 'ok' : res.error}`);
+    },
+  };
+
+  // Signaling for Whep: view(sdp) -> {ok, status, id, sdp} / end(id).
+  const viewSignaling = {
+    async view(sdp) {
+      if (!token) return { ok: false, status: 'unauthorized' };
+      const res = await request({ type: 'view', token, sdp });
+      if (res.ok === true && typeof res.id === 'string' && typeof res.sdp === 'string') {
+        return { ok: true, status: 'ok', id: res.id, sdp: res.sdp };
+      }
+      if (res.error === 'unauthorized') token = null;
+      return { ok: false, status: String(res.error || 'failed') };
+    },
+    async end(id) {
+      if (!token) return;
+      const res = await request({ type: 'view-end', token, id });
+      if (res.error === 'unauthorized') token = null;
+      console.log(`[wt] view-end -> ${res.ok ? 'ok' : res.error}`);
     },
   };
 
@@ -186,8 +221,11 @@ const Wt = (() => {
     parseIp,
     init: (address) => { ip = address; },
     login,
+    ping,
+    onNoMeeting: (handler) => { noMeetingHandler = handler; },
     hasToken: () => token !== null,
     signaling,
+    viewSignaling,
     startKeepalive,
     stopKeepalive,
   };
