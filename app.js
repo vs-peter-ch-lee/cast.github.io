@@ -1,26 +1,29 @@
-// Page wiring: two main buttons, diagnostics, status line, PIN gate for casting and watching.
-// Direction logic lives in whep.js (IFP -> PC) and rtccast.js (PC -> IFP), both WebRTC.
+// Page wiring: role choice (speaker / audience), PIN gate, meeting page (one main button, the shared area, diagnostics).
+// Direction logic lives in whep.js (IFP -> PC, audience) and rtccast.js (PC -> IFP, speaker), both WebRTC;
+// the shared area is share.js.
 //
 // This page is only served from GitHub Pages and talks to one IFP over WebTransport (wt.js), chosen by ?ip=<IFP IPv4>
 // (the IFP's :8080 entry page links here). The PIN token is kept in memory only. On load the page pings the IFP:
-// when it cannot be reached (no meeting: the IFP does not listen) or reports no meeting, everything is disabled and it shows the "cannot reach" text (no automatic retry, reload to check again).
-// The same text is shown when the IFP becomes unreachable while the page is in use (login, cast or watch start fails to connect);
+// when it cannot be reached (no meeting: the IFP does not listen) or reports no meeting, the role buttons are disabled
+// and the entry shows the "cannot reach" text under the title (no automatic retry, reload to check again).
+// The same text is shown when the IFP becomes unreachable while the page is in use;
 // a "Meeting ended" text already shown is never replaced.
-// Both directions need a PIN login first.
 'use strict';
 
 (() => {
   const $ = (id) => document.getElementById(id);
   const ui = {
-    receiveBtn: $('receiveBtn'), stopReceiveBtn: $('stopReceiveBtn'), receiveStats: $('receiveStats'),
-    castBtn: $('castBtn'), stopCastBtn: $('stopCastBtn'), castStats: $('castStats'), castHint: $('castHint'),
-    receiveIdle: $('receiveIdle'), receiveWrap: $('receiveWrap'), receiveStage: $('receiveStage'), receiveVideo: $('receiveVideo'),
-    unmuteBtn: $('unmuteBtn'), fullscreenBtn: $('fullscreenBtn'),
-    status: $('status'), stateRow: $('stateRow'), ifpAddr: $('ifpAddr'),
-    pinView: $('pinView'), pinInput: $('pinInput'), pinError: $('pinError'), pinCancelBtn: $('pinCancelBtn'), pinBtn: $('pinBtn'),
+    status: $('status'), title: $('title'), notice: $('notice'), intro: $('intro'), ifpAddr: $('ifpAddr'),
+    entry: $('entry'), roles: $('roles'), gate: $('gate'), pin: $('pin'), pinBtn: $('pinBtn'), error: $('error'), back: $('back'),
+    room: $('room'), identity: $('identity'), leave: $('leave'), workspaceTitle: $('workspaceTitle'),
+    stage: $('stage'), idle: $('idle'), video: $('receiveVideo'), media: $('media'), mediaStatus: $('mediaStatus'),
+    unmute: $('unmute'), fullscreen: $('fullscreen'), shareRoot: $('shareRoot'),
+    castStats: $('castStats'), receiveStats: $('receiveStats'),
   };
+  let speaker = false;
   let receiving = false;
   let casting = false;
+  let inRoom = false;
 
   // ---- mode ---------------------------------------------------------------------------------
   const query = new URLSearchParams(location.search);
@@ -30,147 +33,171 @@
 
   // ---- static text / environment ------------------------------------------------------------
   document.documentElement.lang = LANG === 'en' ? 'en' : 'zh-Hant';
-  document.querySelectorAll('[data-i18n]').forEach((el) => { el.textContent = t(el.dataset.i18n); });
-  document.querySelectorAll('[data-i18n-alt]').forEach((el) => { el.alt = t(el.dataset.i18nAlt); });
-  ui.ifpAddr.textContent = wtIp || '';
+  document.querySelectorAll('[data-i18n]').forEach((node) => { node.textContent = t(node.dataset.i18n); });
+  ui.ifpAddr.textContent = wtIp || '-';
   const canCast = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
-  if (ui.fullscreenBtn && !document.fullscreenEnabled) ui.fullscreenBtn.hidden = true;
 
-  // ---- controls -----------------------------------------------------------------------------
   let fatalText = '';
   if (!wtMode) fatalText = t('needIfpEntry');
   else if (!wtIp) fatalText = t('badIp');
   else if (typeof WebTransport === 'undefined') fatalText = t('noWebTransport');
-  let blockedText = ''; // no meeting / meeting ended: everything stays disabled until the page is reloaded
+  let blockedText = ''; // no meeting / meeting ended / unreachable: the role buttons stay disabled until the page is reloaded
   let checking = false;
 
-  function showHint(text) {
-    ui.castHint.textContent = text;
-    ui.castHint.hidden = false;
+  // ---- header status ------------------------------------------------------------------------
+  function renderStatus() {
+    let text;
+    let state = 'idle';
+    if (inRoom) {
+      text = t('statusInMeeting');
+      state = 'online';
+    } else if (fatalText || blockedText) {
+      text = t('statusOffline');
+      state = 'notice';
+    } else if (checking) {
+      text = t('connecting');
+    } else {
+      text = t('statusReady');
+    }
+    ui.status.textContent = text;
+    ui.status.dataset.state = state;
   }
 
+  // ---- entry --------------------------------------------------------------------------------
   function applyControls() {
     const locked = !!fatalText || !!blockedText || checking;
-    ui.receiveBtn.disabled = locked;
-    ui.castBtn.disabled = locked || !canCast;
+    ui.roles.querySelectorAll('.role').forEach((b) => { b.disabled = locked; });
   }
 
-  if (fatalText) showHint(fatalText);
-  else if (!canCast) showHint(t('noDisplayMedia'));
-  applyControls();
-
-  // ---- status line --------------------------------------------------------------------------
-  let message = '';
-  function renderStatus() {
-    if (blockedText) {
-      ui.status.textContent = blockedText;
-      ui.stateRow.dataset.state = 'notice';
-    } else if (message) {
-      ui.status.textContent = message;
-      ui.stateRow.dataset.state = 'notice';
-    } else if (casting) {
-      ui.status.textContent = t('stateCasting');
-      ui.stateRow.dataset.state = 'casting';
-    } else if (receiving) {
-      ui.status.textContent = t('stateReceiving');
-      ui.stateRow.dataset.state = 'receiving';
-    } else {
-      ui.status.textContent = t('stateIdle');
-      ui.stateRow.dataset.state = 'idle';
-    }
-    document.body.dataset.state = ui.stateRow.dataset.state; // style.css keys the Pages card on it
+  function renderNotice() {
+    const text = fatalText || blockedText;
+    ui.notice.textContent = text;
+    ui.notice.hidden = !text;
+    ui.intro.hidden = !!text;
   }
-  /** Shows [text] (an end reason or error); '' falls back to the current state (idle / casting / receiving). */
-  function setStatus(text) { message = text || ''; renderStatus(); }
 
-  function setReceiving(on) {
-    receiving = on;
-    ui.receiveIdle.hidden = on;
-    ui.stopReceiveBtn.hidden = !on;
-    ui.receiveWrap.hidden = !on;
-    ui.receiveVideo.hidden = !on;
-    ui.unmuteBtn.hidden = !on;
-    if (on) ui.receiveVideo.muted = true;
-    if (!on) {
-      ui.receiveStats.textContent = '';
+  function showEntry(focusTitle = true) {
+    inRoom = false;
+    ui.room.hidden = true;
+    ui.entry.hidden = false;
+    ui.gate.hidden = true;
+    ui.roles.hidden = false;
+    ui.title.textContent = t('entryTitle');
+    ui.intro.textContent = t('entryIntro');
+    renderNotice();
+    applyControls();
+    renderStatus();
+    if (focusTitle) ui.title.focus();
+  }
+
+  let loginSeq = 0; // bumped by every submit, by back and by leaving; a stale login result is ignored
+
+  function showGate(errorText) {
+    inRoom = false;
+    ui.room.hidden = true;
+    ui.entry.hidden = false;
+    ui.roles.hidden = true;
+    ui.gate.hidden = false;
+    ui.title.textContent = t(speaker ? 'speakerLogin' : 'audienceLogin');
+    ui.intro.textContent = t('gateIntro');
+    renderNotice();
+    ui.pin.value = '';
+    setPinError(errorText || '');
+    renderStatus();
+    ui.pin.focus();
+  }
+
+  function setPinError(text) {
+    ui.error.textContent = text;
+    if (text) ui.pin.setAttribute('aria-invalid', 'true');
+    else ui.pin.removeAttribute('aria-invalid');
+  }
+
+  ui.roles.querySelectorAll('.role').forEach((button) => {
+    button.onclick = () => {
+      speaker = button.dataset.speaker === 'yes';
+      showGate('');
+    };
+  });
+  ui.back.onclick = () => {
+    loginSeq++;
+    ui.pinBtn.disabled = false;
+    ui.pinBtn.textContent = t('joinMeeting');
+    showEntry();
+  };
+
+  // ---- meeting page -------------------------------------------------------------------------
+  function mediaActive() { return receiving || casting; }
+
+  function renderMedia(message) {
+    const on = mediaActive();
+    ui.stage.classList.toggle('off', !receiving);
+    ui.video.hidden = !receiving;
+    ui.idle.hidden = receiving;
+    if (speaker) ui.idle.textContent = t(casting ? 'castKeepOpen' : 'speakerIdle');
+    else ui.idle.textContent = t('audienceIdle');
+    ui.media.textContent = t(speaker ? (on ? 'castStop' : 'castStart') : (on ? 'viewStop' : 'viewStart'));
+    ui.media.disabled = speaker && !canCast;
+    ui.unmute.hidden = !(receiving && ui.video.muted);
+    ui.fullscreen.hidden = !(receiving && document.fullscreenEnabled);
+    let text;
+    if (message) text = message;
+    else if (speaker && !canCast) text = t('noDisplayMedia');
+    else if (speaker) text = t(casting ? 'castOn' : 'castOff');
+    else text = t(receiving ? 'viewOn' : 'viewOff');
+    ui.mediaStatus.textContent = text;
+  }
+
+  function enterRoom() {
+    inRoom = true;
+    ui.identity.textContent = t(speaker ? 'speaker' : 'audience');
+    ui.workspaceTitle.textContent = t(speaker ? 'speakerTitle' : 'audienceTitle');
+    ui.castStats.textContent = '';
+    ui.receiveStats.textContent = '';
+    ui.castStats.hidden = !speaker;
+    ui.receiveStats.hidden = speaker;
+    renderMedia('');
+    ui.entry.hidden = true;
+    ui.room.hidden = false;
+    renderStatus();
+    ShareArea.start(ui.shareRoot, { mediaActive, leave: onShareLeave });
+    ui.workspaceTitle.focus();
+    window.scrollTo(0, 0);
+  }
+
+  /** Stops media and the shared area and drops the token, without any status text. */
+  function closeMeetingPage() {
+    ShareArea.stop();
+    if (receiving) {
+      Whep.stop();
+      receiving = false;
       if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     }
-    renderStatus();
-  }
-
-  function setCasting(on) {
-    casting = on;
-    ui.castBtn.hidden = on;
-    ui.stopCastBtn.hidden = !on;
-    if (!on) ui.castStats.textContent = '';
-    // Keep the IFP-side handshake alive while casting; a dropped connection does not end the cast.
-    if (on) Wt.startKeepalive();
-    else Wt.stopKeepalive();
-    renderStatus();
-  }
-
-  function endReceive(reasonText) {
-    if (!receiving) return;
-    Whep.stop();
-    setReceiving(false);
-    setStatus(reasonText);
-  }
-
-  function endCast(reasonText) {
-    if (!casting) return;
-    RtcCast.stop();
-    setCasting(false);
-    setStatus(reasonText);
-  }
-
-  ui.unmuteBtn.onclick = () => {
-    ui.receiveVideo.muted = false;
-    ui.receiveVideo.play().catch(() => {});
-    ui.unmuteBtn.hidden = true;
-  };
-  ui.fullscreenBtn.onclick = () => {
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
-    else ui.receiveStage.requestFullscreen().catch(() => {});
-  };
-
-  // ---- PIN gate (casting and watching) -----------------------------------------------------
-  let pinAction = null; // 'cast' | 'receive': what to start once the PIN is accepted
-
-  /** Shows the PIN form for [action]. Casting is stopped for 'cast' only; nothing is shown once the meeting is over. */
-  function showPin(errorText, action) {
-    if (blockedText) return;
-    pinAction = action;
-    if (action === 'cast') {
-      endCast('');
-      ui.castBtn.hidden = true;
+    if (casting) {
+      RtcCast.stop();
+      casting = false;
+      Wt.stopKeepalive();
     }
-    ui.pinView.hidden = false;
-    ui.pinError.textContent = errorText || '';
-    ui.pinInput.value = '';
-    ui.pinView.scrollIntoView({ block: 'nearest' });
-    ui.pinInput.focus();
+    Wt.logout();
   }
 
-  function hidePin() {
-    pinAction = null;
-    ui.pinView.hidden = true;
-    ui.pinError.textContent = '';
-    ui.castBtn.hidden = casting;
+  function home() {
+    loginSeq++;
+    closeMeetingPage();
+    showEntry();
   }
+  ui.leave.onclick = home;
 
-  /** The IFP has no meeting (never started, ended) or cannot be reached: show [text], hide the PIN form, disable the controls. Media is not touched here. */
+  /** The IFP has no meeting (never started, ended) or cannot be reached: back to the entry with [text] under the title. */
   function setNoMeeting(text) {
     blockedText = text;
     loginSeq++;
-    hidePin();
-    showHint(text);
-    applyControls();
-    renderStatus();
+    closeMeetingPage();
+    showEntry();
   }
   // A no_meeting reply never replaces a text already shown (e.g. "Meeting ended" from the notice).
   Wt.onNoMeeting(markUnreachable);
 
-  /** The IFP cannot be reached while the page is in use (login, cast, watch): same screen as on load, unless a text is already shown. */
   function markUnreachable() { if (!blockedText) setNoMeeting(t('unreachable')); }
   function isConnectFail(e) { return !!e && e.message === t('connectFail'); }
   /** Wraps a Wt signaling call so that a connection failure also shows the "cannot reach" screen, then rethrows. */
@@ -187,119 +214,131 @@
   const castSignaling = { invite: watchUnreachable(Wt.signaling.invite), end: Wt.signaling.end };
   const viewSignaling = { view: watchUnreachable(Wt.viewSignaling.view), end: Wt.viewSignaling.end };
 
+  function onShareLeave(reason) {
+    if (reason === 'unauthorized') home();
+    else if (mediaActive()) meetingEnded();
+    else markUnreachable();
+  }
+
   /** The IFP sent its end-of-meeting notice over a 'meeting' DataChannel: stop watching and casting. */
   function meetingEnded() {
-    if (receiving) {
-      Whep.stop();
-      setReceiving(false);
-    }
-    if (casting) {
-      RtcCast.stop();
-      setCasting(false);
-    }
     setNoMeeting(t('meetingEnded'));
   }
 
-  /** After a failed cast start: if the login is no longer valid (an unauthorized invite dropped the token), ask again. */
-  function recheckAuth() {
-    if (!Wt.hasToken()) showPin(t('pinChanged'), 'cast');
+  /** The login is no longer valid (PIN changed): back to the PIN form for the same role. */
+  function askPinAgain() {
+    loginSeq++;
+    closeMeetingPage();
+    showGate(t('pinChanged'));
   }
 
-  let loginSeq = 0; // bumped by every submit, by cancel and by no-meeting; a stale login result is ignored
-  ui.pinView.onsubmit = async (ev) => {
+  function fullscreenToggle() {
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else ui.stage.requestFullscreen().catch(() => {});
+  }
+  ui.fullscreen.onclick = fullscreenToggle;
+  ui.unmute.onclick = () => {
+    ui.video.muted = false;
+    ui.video.play().catch(() => {});
+    ui.unmute.hidden = true;
+  };
+
+  // ---- PIN gate -----------------------------------------------------------------------------
+  ui.gate.onsubmit = async (ev) => {
     ev.preventDefault();
-    const pin = ui.pinInput.value.trim();
+    const pin = ui.pin.value.trim();
     if (!/^[0-9]{6}$/.test(pin)) {
-      ui.pinError.textContent = t('pinInvalid');
+      setPinError(t('pinInvalid'));
+      ui.pin.focus();
+      ui.pin.select();
       return;
     }
     // WebTransport can wait a long time here (the browser's local-network permission prompt): show progress.
     const seq = ++loginSeq;
-    const okLabel = ui.pinBtn.textContent;
     ui.pinBtn.disabled = true;
     ui.pinBtn.textContent = t('connecting');
-    ui.pinError.textContent = '';
+    setPinError('');
     try {
       const ok = (await Wt.login(pin)).ok;
-      if (seq !== loginSeq) return; // cancelled while waiting
+      if (seq !== loginSeq) return; // left the form while waiting
       if (ok) {
-        const action = pinAction;
-        hidePin();
-        if (action === 'receive') {
-          startReceive();
-        } else if (navigator.userActivation && !navigator.userActivation.isActive) {
-          // Screen capture needs a fresh click. A long wait (permission prompt) can use it up: ask for one more click.
-          setStatus(t('connectedClickCast'));
-          ui.castBtn.focus();
-        } else {
-          startCast();
-        }
+        ui.pin.value = '';
+        enterRoom();
       } else {
-        ui.pinError.textContent = t('pinWrong');
-        ui.pinInput.select();
+        setPinError(t('pinWrong'));
+        ui.pin.focus();
+        ui.pin.select();
       }
     } catch (e) {
       if (seq !== loginSeq) return;
       if (isConnectFail(e)) markUnreachable();
-      else ui.pinError.textContent = (e && e.message) || t('connectFail');
+      else setPinError((e && e.message) || t('connectFail'));
     } finally {
-      ui.pinBtn.disabled = false;
-      ui.pinBtn.textContent = okLabel;
+      if (seq === loginSeq) {
+        ui.pinBtn.disabled = false;
+        ui.pinBtn.textContent = t('joinMeeting');
+      }
     }
   };
-  ui.pinCancelBtn.onclick = () => { loginSeq++; hidePin(); };
 
   // ---- meeting check on load ----------------------------------------------------------------
   async function checkMeeting() {
     checking = true;
     applyControls();
-    setStatus(t('connecting'));
+    renderStatus();
     try {
       const res = await Wt.ping();
-      setStatus('');
       if (res.meeting === false) markUnreachable();
     } catch (e) {
       if (isConnectFail(e)) markUnreachable();
-      else setStatus((e && e.message) || t('connectFail'));
     } finally {
       checking = false;
       applyControls();
+      renderStatus();
     }
   }
-  if (!fatalText) checkMeeting();
 
-  // ---------------------------------------------------------------------------------------
+  // ---- media (speaker: cast, audience: watch) ------------------------------------------------
+  function endReceive(reasonText) {
+    if (!receiving) return;
+    Whep.stop();
+    receiving = false;
+    ui.receiveStats.textContent = '';
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    renderMedia(reasonText);
+  }
+
+  function endCast(reasonText) {
+    if (!casting) return;
+    RtcCast.stop();
+    casting = false;
+    Wt.stopKeepalive();
+    ui.castStats.textContent = '';
+    renderMedia(reasonText);
+  }
 
   async function startReceive() {
-    setStatus('');
-    setReceiving(true);
+    receiving = true;
+    ui.video.muted = true;
+    renderMedia('');
     try {
       await Whep.start({
         stats: ui.receiveStats,
-        video: ui.receiveVideo,
+        video: ui.video,
         signaling: viewSignaling,
         onEnded: (text) => endReceive(text),
         onMeetingEnded: meetingEnded,
       });
     } catch (e) {
-      if (e && e.code === 'unauthorized') {
-        endReceive('');
-        showPin(t('pinChanged'), 'receive');
-      } else {
-        endReceive(tMsg((e && e.message) || String(e)));
-      }
+      if (e && e.code === 'unauthorized') askPinAgain();
+      else endReceive(tMsg((e && e.message) || String(e)));
     }
   }
 
-  ui.receiveBtn.onclick = () => {
-    if (Wt.hasToken()) startReceive();
-    else showPin(t('pinRequired'), 'receive');
-  };
-  ui.stopReceiveBtn.onclick = () => endReceive('');
-
   async function startCast() {
-    setStatus('');
-    setCasting(true);
+    casting = true;
+    Wt.startKeepalive();
+    renderMedia('');
     try {
       await RtcCast.start({
         stats: ui.castStats,
@@ -309,15 +348,21 @@
       });
     } catch (e) {
       endCast(tMsg((e && e.message) || String(e)));
-      recheckAuth();
+      if (!Wt.hasToken() && inRoom) askPinAgain();
     }
   }
 
-  ui.castBtn.onclick = () => {
-    if (Wt.hasToken()) startCast();
-    else showPin('', 'cast');
+  ui.media.onclick = () => {
+    if (speaker) {
+      if (casting) endCast('');
+      else startCast();
+    } else if (receiving) {
+      endReceive('');
+    } else {
+      startReceive();
+    }
   };
-  ui.stopCastBtn.onclick = () => endCast('');
 
-  renderStatus();
+  showEntry(false);
+  if (!fatalText) checkMeeting();
 })();

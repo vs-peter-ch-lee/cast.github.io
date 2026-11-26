@@ -9,6 +9,11 @@
 //   {"type":"ping"}                                          -> {"ok":true,"meeting":<bool>}   (no token needed)
 // Without a meeting, login / invite / end / view / view-end answer {"ok":false,"error":"no_meeting"}: request() drops the
 // token and calls the handler given to onNoMeeting.
+// Shared-area ops (share-version, share-list, share-thumb, share-file, share-clip, share-clip-image) use the same
+// request stream but a framed reply: 4-byte big-endian header length, UTF-8 JSON header ({"ok":true,"size",...} or
+// {"ok":false,"error"}), then `size` body bytes. transfer() handles them; a failure there never closes the session,
+// and only unauthorized drops the token; no_meeting keeps it so the next poll still asks the IFP and gets the same
+// answer (the shared area itself decides what the page shows).
 // The login token lives only in this closure (never in storage, cookie or URL): a reload asks for the PIN again.
 'use strict';
 
@@ -24,6 +29,12 @@ const Wt = (() => {
   const REQUEST_TIMEOUT_MS = 10000;
   const PING_MS = 15000;
   const MAX_REPLY_BYTES = 1 << 20;
+  // Shared area: connect + request + header within POLL / SHARE ms; then each body read within the idle limit.
+  const POLL_TIMEOUT_MS = 5000;
+  const SHARE_TIMEOUT_MS = 10000;
+  const SHARE_IDLE_MS = 10000;
+  const MAX_HEADER_BYTES = 64 * 1024;
+  const CHUNK_BYTES = 1 << 20;
 
   // Read once at page load (fingerprints.js); which entries are valid is decided at every connect.
   const FINGERPRINTS = Array.isArray(window.WT_FINGERPRINTS) ? window.WT_FINGERPRINTS.slice() : [];
@@ -99,11 +110,13 @@ const Wt = (() => {
     return connecting;
   }
 
-  async function exchange(wt, obj) {
-    const stream = await wt.createBidirectionalStream();
+  async function writeRequest(stream, obj) {
     const writer = stream.writable.getWriter();
     await writer.write(ENC.encode(JSON.stringify(obj)));
     await writer.close();
+  }
+
+  async function readReply(stream) {
     const reader = stream.readable.getReader();
     const chunks = [];
     let total = 0;
@@ -120,6 +133,12 @@ const Wt = (() => {
     const res = JSON.parse(DEC.decode(all));
     if (!res || typeof res !== 'object') throw new Error('bad reply');
     return res;
+  }
+
+  async function exchange(wt, obj) {
+    const stream = await wt.createBidirectionalStream();
+    await writeRequest(stream, obj);
+    return readReply(stream);
   }
 
   /** One request/reply on a new stream. Throws Error(connectFail text) when the IFP cannot be reached. */
@@ -162,6 +181,118 @@ const Wt = (() => {
     if (res.error === 'wrong_pin') return { ok: false, error: 'wrong_pin' };
     throw new Error(t('connectFail'));
   }
+
+  /** Reads exactly n bytes per take(n) from a stream reader; onData runs on every chunk received. */
+  function byteReader(reader, guard, onData) {
+    let pending = new Uint8Array(0);
+    return async function take(n) {
+      const out = new Uint8Array(n);
+      let filled = 0;
+      while (filled < n) {
+        if (!pending.length) {
+          const { done, value } = await guard(reader.read());
+          if (done) throw new Error('stream ended early');
+          pending = value;
+          onData();
+        }
+        const count = Math.min(n - filled, pending.length);
+        out.set(pending.subarray(0, count), filled);
+        filled += count;
+        pending = pending.subarray(count);
+      }
+      return out;
+    };
+  }
+
+  /**
+   * One shared-area request on its own stream. Resolves {ok:true, header, body:Uint8Array} or {ok:false, error}:
+   * a server error code, 'aborted' when [signal] fires, or 'unreachable' for any other failure (including timeouts).
+   * Never throws and never closes the session.
+   */
+  async function transfer(obj, { signal, timeoutMs = SHARE_TIMEOUT_MS, idleMs = SHARE_IDLE_MS } = {}) {
+    if (signal && signal.aborted) return { ok: false, error: 'aborted' };
+    if (!token) return { ok: false, error: 'unauthorized' };
+    const sent = token;
+    let reader = null;
+    let writer = null;
+    let timer = null;
+    let failure = null;
+    let bodyIdleMs = 0;
+    let stop;
+    const stopped = new Promise((_, reject) => { stop = reject; });
+    stopped.catch(() => {});
+    const guard = (promise) => Promise.race([promise, stopped]);
+    const fail = (code) => {
+      if (!failure) failure = code;
+      stop(new Error(code));
+      try { if (writer) writer.abort().catch(() => {}); } catch (e) { /* ignore */ }
+      try { if (reader) reader.cancel().catch(() => {}); } catch (e) { /* ignore */ }
+    };
+    const arm = (ms) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => fail('unreachable'), ms);
+    };
+    const onAbort = () => fail('aborted');
+    if (signal) signal.addEventListener('abort', onAbort);
+    arm(timeoutMs);
+    try {
+      const wt = await guard(ensureSession());
+      const stream = await guard(wt.createBidirectionalStream());
+      writer = stream.writable.getWriter();
+      await guard(writer.write(ENC.encode(JSON.stringify({ ...obj, token: sent }))));
+      await guard(writer.close());
+      reader = stream.readable.getReader();
+      const take = byteReader(reader, guard, () => { if (bodyIdleMs) arm(bodyIdleMs); });
+      const prefix = await take(4);
+      const length = new DataView(prefix.buffer, prefix.byteOffset, 4).getUint32(0);
+      if (length > MAX_HEADER_BYTES) throw new Error('header too large');
+      const header = JSON.parse(DEC.decode(await take(length)));
+      if (!header || typeof header !== 'object') throw new Error('bad header');
+      if (header.ok !== true) {
+        const error = typeof header.error === 'string' ? header.error : 'unreachable';
+        if (error === 'unauthorized' && token === sent) token = null;
+        return { ok: false, error };
+      }
+      if (!Number.isSafeInteger(header.size) || header.size < 0) throw new Error('bad body size');
+      bodyIdleMs = idleMs;
+      arm(idleMs);
+      const body = await take(header.size);
+      return { ok: true, header, body };
+    } catch (e) {
+      return { ok: false, error: failure || 'unreachable' };
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      try { if (reader) reader.cancel().catch(() => {}); } catch (e) { /* ignore */ }
+    }
+  }
+
+  /** Fetches [total] bytes as 1 MiB ranges of [base]; onProgress(loadedBytes) after each range. */
+  async function fetchRanges(base, total, signal, onProgress) {
+    const parts = [];
+    let loaded = 0;
+    do {
+      const length = Math.min(CHUNK_BYTES, total - loaded);
+      const res = await transfer({ ...base, offset: loaded, length }, { signal });
+      if (!res.ok) return { ok: false, error: res.error };
+      if (res.body.length !== length) return { ok: false, error: 'unreachable' };
+      parts.push(res.body);
+      loaded += length;
+      if (onProgress) onProgress(loaded);
+    } while (loaded < total);
+    return { ok: true, blob: new Blob(parts, { type: 'application/octet-stream' }) };
+  }
+
+  const share = {
+    version: (signal) => transfer({ type: 'share-version' }, { signal, timeoutMs: POLL_TIMEOUT_MS }),
+    list: (signal) => transfer({ type: 'share-list' }, { signal }),
+    thumb: (path, signal) => transfer({ type: 'share-thumb', path }, { signal }),
+    clip: (signal) => transfer({ type: 'share-clip' }, { signal }),
+    download: (file, signal, onProgress) =>
+      fetchRanges({ type: 'share-file', path: file.path, size: file.size, mtime: file.mtime }, file.size, signal, onProgress),
+    clipImage: (clip, signal, onProgress) =>
+      fetchRanges({ type: 'share-clip-image', seq: clip.seq }, clip.size, signal, onProgress),
+  };
 
   // Signaling for RtcCast: invite(w, h, sdp, onId) / end(id).
   const signaling = {
@@ -224,6 +355,8 @@ const Wt = (() => {
     ping,
     onNoMeeting: (handler) => { noMeetingHandler = handler; },
     hasToken: () => token !== null,
+    logout: () => { token = null; },
+    share,
     signaling,
     viewSignaling,
     startKeepalive,
