@@ -379,7 +379,8 @@ const ShareArea = (() => {
   }
 
   function progressPercent(loaded, size) {
-    if (!(loaded >= 0) || !(size > 0)) return undefined;
+    if (!(loaded >= 0) || !(size >= 0)) return undefined;
+    if (size === 0) return 100;
     return Math.min(100, Math.floor((loaded * 100) / size));
   }
 
@@ -441,7 +442,7 @@ const ShareArea = (() => {
     const up = s.upload;
     s.uploadButton.disabled = up !== null;
     s.uploadCancel.hidden = up === null;
-    s.uploadCancel.disabled = up !== null && up.cancelled;
+    s.uploadCancel.disabled = up !== null && (up.cancelled || up.finishing);
     s.uploadProgress.hidden = up === null;
     if (up) {
       s.uploadProgress.textContent = up.pct === undefined ? t('uploading') : `${t('uploading')} ${up.pct}%`;
@@ -457,7 +458,7 @@ const ShareArea = (() => {
 
   function cancelUpload(s) {
     const up = s.upload;
-    if (!up || up.cancelled) return;
+    if (!up || up.cancelled || up.finishing) return;
     up.cancelled = true;
     up.controller.abort();
     renderUpload(s);
@@ -481,6 +482,10 @@ const ShareArea = (() => {
         if (pct === up.pct) return;
         up.pct = pct;
         renderUpload(s);
+      }, () => {
+        if (!s.alive || s.upload !== up) return;
+        up.finishing = true;
+        renderUpload(s);
       });
     } catch (e) {
       res = { ok: false, error: 'failed' };
@@ -494,7 +499,7 @@ const ShareArea = (() => {
       refreshListNow(s);
     } else if (up.cancelled) {
       showUploadNote(s, t('uploadCancelled'), false);
-    } else if (res && res.error === 'no_meeting') {
+    } else if (res && (res.error === 'no_meeting' || res.error === 'unreachable' || res.error === 'aborted')) {
       showUploadNote(s, '', false);
     } else {
       showUploadNote(s, uploadErrorText(res && res.error), true);

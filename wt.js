@@ -322,12 +322,18 @@ const Wt = (() => {
    * name chosen by the IFP) or {ok:false, error} with the IFP's error code, 'aborted' or 'unreachable'. When [signal]
    * fires, a share-upload-cancel is sent so the IFP drops the partial file at once.
    */
-  async function upload(file, signal, onProgress) {
-    const begun = await transfer({ type: 'share-upload-start', name: file.name, size: file.size }, { signal });
+  async function upload(file, signal, onProgress, onFinishing) {
+    // start is sent without [signal]: a cancel before its reply waits for the id so the cancel can still be sent.
+    const begun = await transfer({ type: 'share-upload-start', name: file.name, size: file.size });
     if (!begun.ok) return begun;
     const id = begun.header.id;
     if (typeof id !== 'string') return { ok: false, error: 'failed' };
     const cancel = () => transfer({ type: 'share-upload-cancel', id }, { timeoutMs: UPLOAD_CANCEL_MS });
+    const cancelQuietly = () => { cancel().catch(() => {}); };
+    if (signal && signal.aborted) {
+      await cancel();
+      return { ok: false, error: 'aborted' };
+    }
     const chunk = begun.header.chunk;
     if (!Number.isSafeInteger(chunk) || chunk <= 0) {
       await cancel();
@@ -338,18 +344,25 @@ const Wt = (() => {
     while (received < file.size) {
       const base = received;
       const end = Math.min(base + step, file.size);
-      const res = await transfer(
-        { type: 'share-upload-chunk', id, offset: base },
-        {
-          signal,
-          frame: file.slice(base, end),
-          timeoutMs: UPLOAD_WRITE_IDLE_MS,
-          replyMs: UPLOAD_REPLY_MS,
-          onSent: (sent) => { if (onProgress) onProgress(base + sent); },
-        },
-      );
+      let res;
+      try {
+        res = await transfer(
+          { type: 'share-upload-chunk', id, offset: base },
+          {
+            signal,
+            frame: file.slice(base, end),
+            timeoutMs: UPLOAD_WRITE_IDLE_MS,
+            replyMs: UPLOAD_REPLY_MS,
+            onSent: (sent) => { if (onProgress) onProgress(base + sent); },
+          },
+        );
+      } catch (e) {
+        cancelQuietly();
+        return { ok: false, error: 'failed' };
+      }
       if (!res.ok) {
         if (res.error === 'aborted') await cancel();
+        else cancelQuietly();
         return res;
       }
       if (res.header.received !== end) {
@@ -359,11 +372,14 @@ const Wt = (() => {
       received = end;
       if (onProgress) onProgress(received);
     }
-    const done = await transfer({ type: 'share-upload-finish', id }, { signal });
-    if (!done.ok) {
-      if (done.error === 'aborted') await cancel();
-      return done;
+    if (signal && signal.aborted) {
+      await cancel();
+      return { ok: false, error: 'aborted' };
     }
+    // Once finish is sent the file may already be stored, so it is not tied to [signal] and cannot be cancelled.
+    if (onFinishing) onFinishing();
+    const done = await transfer({ type: 'share-upload-finish', id });
+    if (!done.ok) return done;
     return { ok: true, name: typeof done.header.name === 'string' ? done.header.name : file.name };
   }
 
