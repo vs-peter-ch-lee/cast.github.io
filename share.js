@@ -1,6 +1,6 @@
-// Shared area of the meeting page: the meeting folder list (thumbnails, download) and the IFP clipboard's latest item.
+// Shared area of the meeting page: the meeting folder list (thumbnails, download, upload of one file) and the IFP clipboard's latest item.
 // Requests go through Wt.share (wt.js); this file owns polling, rendering and the stream budget
-// (5 at a time: polling 1, thumbnails 2, downloads 2). Names, paths and clipboard text are only ever set with textContent.
+// (5 at a time: polling 1, thumbnails 2, downloads 2; an upload adds 1 more). Names, paths and clipboard text are only ever set with textContent.
 //   ShareArea.start(root, { mediaActive: () => boolean, leave: (reason) => void })   reason: 'unreachable' | 'unauthorized'
 //   ShareArea.stop()
 'use strict';
@@ -110,6 +110,7 @@ const ShareArea = (() => {
       forceList: false,
       wake: null,
       clipView: null,
+      upload: null,
     };
     s.pollCtl = newController(s);
     session = s;
@@ -147,9 +148,33 @@ const ShareArea = (() => {
     s.root.appendChild(el('h2', '', t('shareTitle')));
     const folderHead = el('div', 'sectionhead');
     folderHead.appendChild(el('h3', '', t('folderTitle')));
+    const tools = el('div', 'headtools');
     s.count = el('small', '', t('fileCount', 0));
-    folderHead.appendChild(s.count);
+    s.uploadProgress = el('small', 'progress');
+    s.uploadProgress.hidden = true;
+    s.uploadCancel = el('button', 'link', t('uploadCancel'));
+    s.uploadCancel.type = 'button';
+    s.uploadCancel.hidden = true;
+    s.uploadCancel.onclick = () => cancelUpload(s);
+    s.uploadButton = el('button', 'tool', t('upload'));
+    s.uploadButton.type = 'button';
+    s.uploadButton.setAttribute('aria-label', t('uploadLabel'));
+    s.uploadPicker = el('input');
+    s.uploadPicker.type = 'file';
+    s.uploadPicker.hidden = true;
+    s.uploadButton.onclick = () => { if (!s.upload) s.uploadPicker.click(); };
+    s.uploadPicker.onchange = () => {
+      const file = s.uploadPicker.files && s.uploadPicker.files[0];
+      s.uploadPicker.value = '';
+      if (file) startUpload(s, file);
+    };
+    tools.append(s.count, s.uploadProgress, s.uploadCancel, s.uploadButton, s.uploadPicker);
+    folderHead.appendChild(tools);
     s.root.appendChild(folderHead);
+    s.uploadNote = el('p', 'uploadnote');
+    s.uploadNote.setAttribute('role', 'status');
+    s.uploadNote.hidden = true;
+    s.root.appendChild(s.uploadNote);
     s.list = el('div');
     s.root.appendChild(s.list);
     s.listEmpty = el('p', 'empty', t('nothingYet'));
@@ -402,6 +427,78 @@ const ShareArea = (() => {
     if (current.phase === 'busy') return;
     current.note.textContent = t('downloadFailed');
     current.note.hidden = false;
+  }
+
+  // ---- upload ---------------------------------------------------------------------------------------
+
+  function showUploadNote(s, text, warning) {
+    s.uploadNote.textContent = text;
+    s.uploadNote.className = warning ? 'uploadnote warning' : 'uploadnote';
+    s.uploadNote.hidden = !text;
+  }
+
+  function renderUpload(s) {
+    const up = s.upload;
+    s.uploadButton.disabled = up !== null;
+    s.uploadCancel.hidden = up === null;
+    s.uploadCancel.disabled = up !== null && up.cancelled;
+    s.uploadProgress.hidden = up === null;
+    if (up) {
+      s.uploadProgress.textContent = up.pct === undefined ? t('uploading') : `${t('uploading')} ${up.pct}%`;
+    }
+  }
+
+  function uploadErrorText(error) {
+    if (error === 'too_large') return t('uploadTooLarge');
+    if (error === 'busy') return t('uploadBusy');
+    if (error === 'aborted' || error === 'cancelled') return t('uploadCancelled');
+    return t('uploadFailed');
+  }
+
+  function cancelUpload(s) {
+    const up = s.upload;
+    if (!up || up.cancelled) return;
+    up.cancelled = true;
+    up.controller.abort();
+    renderUpload(s);
+  }
+
+  async function startUpload(s, file) {
+    if (s.upload) return;
+    if (file.size > Wt.share.uploadMaxBytes) {
+      showUploadNote(s, t('uploadTooLarge'), true);
+      return;
+    }
+    const up = { controller: newController(s), cancelled: false, pct: progressPercent(0, file.size) };
+    s.upload = up;
+    showUploadNote(s, '', false);
+    renderUpload(s);
+    let res;
+    try {
+      res = await Wt.share.upload(file, up.controller.signal, (sent) => {
+        if (!s.alive || s.upload !== up) return;
+        const pct = progressPercent(sent, file.size);
+        if (pct === up.pct) return;
+        up.pct = pct;
+        renderUpload(s);
+      });
+    } catch (e) {
+      res = { ok: false, error: 'failed' };
+    }
+    s.controllers.delete(up.controller);
+    if (!s.alive) return;
+    s.upload = null;
+    renderUpload(s);
+    if (res && res.ok) {
+      showUploadNote(s, t('uploadDone', res.name), false);
+      refreshListNow(s);
+    } else if (up.cancelled) {
+      showUploadNote(s, t('uploadCancelled'), false);
+    } else if (res && res.error === 'no_meeting') {
+      showUploadNote(s, '', false);
+    } else {
+      showUploadNote(s, uploadErrorText(res && res.error), true);
+    }
   }
 
   // ---- clipboard ------------------------------------------------------------------------------------

@@ -41,6 +41,9 @@ const I18N = {
     copy: '複製', copied: '已複製', truncated: '內容過長，已截斷',
     tooLarge: '太大，無法下載', downloadFailed: '下載失敗', download: '下載', downloading: '下載中',
     downloadLabel: (name) => `下載 ${name}`, clipImage: '剪貼簿圖片',
+    upload: '上傳', uploading: '上傳中', uploadCancel: '取消', uploadLabel: '上傳檔案到會議資料夾',
+    uploadTooLarge: '檔案太大，無法上傳（上限 100 MB）', uploadBusy: 'IFP 忙碌中，請稍後再試',
+    uploadFailed: '上傳失敗', uploadCancelled: '已取消上傳', uploadDone: (name) => `上傳完成：${name}`,
   },
   en: {
     title: 'Casting', brandSub: 'Classroom meeting',
@@ -75,6 +78,9 @@ const I18N = {
     copy: 'Copy', copied: 'Copied', truncated: 'Too long, truncated',
     tooLarge: 'Too large to download', downloadFailed: 'Download failed', download: 'Download', downloading: 'Downloading',
     downloadLabel: (name) => `Download ${name}`, clipImage: 'Clipboard image',
+    upload: 'Upload', uploading: 'Uploading', uploadCancel: 'Cancel', uploadLabel: 'Upload a file to the meeting folder',
+    uploadTooLarge: 'File too large to upload (limit 100 MB)', uploadBusy: 'The IFP is busy. Try again later',
+    uploadFailed: 'Upload failed', uploadCancelled: 'Upload cancelled', uploadDone: (name) => `Upload complete: ${name}`,
   },
 };
 /** UI text for [key]; function entries take args. */

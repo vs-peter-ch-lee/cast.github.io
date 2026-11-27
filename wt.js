@@ -14,6 +14,9 @@
 // {"ok":false,"error"}), then `size` body bytes. transfer() handles them; a failure there never closes the session,
 // and only unauthorized drops the token; no_meeting keeps it so the next poll still asks the IFP and gets the same
 // answer (the shared area itself decides what the page shows).
+// Upload ops (share-upload-start / -chunk / -finish / -cancel) answer in the same framed reply with an empty body.
+// share-upload-chunk is the only framed request: 4-byte big-endian header length, JSON header, then the chunk bytes
+// up to the end of the write side. Wt.share.upload() runs the whole flow.
 // The login token lives only in this closure (never in storage, cookie or URL): a reload asks for the PIN again.
 'use strict';
 
@@ -35,6 +38,16 @@ const Wt = (() => {
   const SHARE_IDLE_MS = 10000;
   const MAX_HEADER_BYTES = 64 * 1024;
   const CHUNK_BYTES = 1 << 20;
+  // Upload (share-upload-*): at most 100 MiB per file, sent as chunks of at most 8 MiB (the IFP tells its chunk size),
+  // each on its own stream and written in 256 KiB pieces so that progress follows the bytes sent.
+  const UPLOAD_MAX_BYTES = 104857600;
+  const UPLOAD_CHUNK_MAX_BYTES = 8 << 20;
+  const UPLOAD_PIECE_BYTES = 256 * 1024;
+  // No piece accepted by the stream within this long: the chunk failed (the IFP gives up after 20 s without data).
+  const UPLOAD_WRITE_IDLE_MS = 30000;
+  // After the last byte of a chunk: the IFP reads for at most 120 s per chunk and then answers.
+  const UPLOAD_REPLY_MS = 130000;
+  const UPLOAD_CANCEL_MS = 5000;
 
   // Read once at page load (fingerprints.js); which entries are valid is decided at every connect.
   const FINGERPRINTS = Array.isArray(window.WT_FINGERPRINTS) ? window.WT_FINGERPRINTS.slice() : [];
@@ -208,8 +221,11 @@ const Wt = (() => {
    * One shared-area request on its own stream. Resolves {ok:true, header, body:Uint8Array} or {ok:false, error}:
    * a server error code, 'aborted' when [signal] fires, or 'unreachable' for any other failure (including timeouts).
    * Never throws and never closes the session.
+   * With [frame] (a Blob) the request is framed: 4-byte big-endian header length, the JSON header, then the Blob's bytes;
+   * [timeoutMs] is then the longest wait for one piece to be accepted, [replyMs] the wait for the reply after the last
+   * byte, and onSent(bytesOfFrameSent) runs after each piece.
    */
-  async function transfer(obj, { signal, timeoutMs = SHARE_TIMEOUT_MS, idleMs = SHARE_IDLE_MS } = {}) {
+  async function transfer(obj, { signal, timeoutMs = SHARE_TIMEOUT_MS, idleMs = SHARE_IDLE_MS, frame, replyMs, onSent } = {}) {
     if (signal && signal.aborted) return { ok: false, error: 'aborted' };
     if (!token) return { ok: false, error: 'unauthorized' };
     const sent = token;
@@ -239,8 +255,25 @@ const Wt = (() => {
       const wt = await guard(ensureSession());
       const stream = await guard(wt.createBidirectionalStream());
       writer = stream.writable.getWriter();
-      await guard(writer.write(ENC.encode(JSON.stringify({ ...obj, token: sent }))));
+      const head = ENC.encode(JSON.stringify({ ...obj, token: sent }));
+      if (frame) {
+        const first = new Uint8Array(4 + head.length);
+        new DataView(first.buffer).setUint32(0, head.length);
+        first.set(head, 4);
+        await guard(writer.write(first));
+        for (let at = 0; at < frame.size; at += UPLOAD_PIECE_BYTES) {
+          const end = Math.min(at + UPLOAD_PIECE_BYTES, frame.size);
+          const piece = new Uint8Array(await guard(frame.slice(at, end).arrayBuffer()));
+          arm(timeoutMs);
+          await guard(writer.write(piece));
+          arm(timeoutMs);
+          if (onSent) onSent(end);
+        }
+      } else {
+        await guard(writer.write(head));
+      }
       await guard(writer.close());
+      if (frame && replyMs) arm(replyMs);
       reader = stream.readable.getReader();
       const take = byteReader(reader, guard, () => { if (bodyIdleMs) arm(bodyIdleMs); });
       const prefix = await take(4);
@@ -283,7 +316,60 @@ const Wt = (() => {
     return { ok: true, blob: new Blob(parts, { type: 'application/octet-stream' }) };
   }
 
+  /**
+   * Uploads [file] to the meeting folder: share-upload-start, one share-upload-chunk per chunk (one stream at a time),
+   * share-upload-finish. onProgress(bytesSent) follows the bytes handed to the stream. Resolves {ok:true, name} (the final
+   * name chosen by the IFP) or {ok:false, error} with the IFP's error code, 'aborted' or 'unreachable'. When [signal]
+   * fires, a share-upload-cancel is sent so the IFP drops the partial file at once.
+   */
+  async function upload(file, signal, onProgress) {
+    const begun = await transfer({ type: 'share-upload-start', name: file.name, size: file.size }, { signal });
+    if (!begun.ok) return begun;
+    const id = begun.header.id;
+    if (typeof id !== 'string') return { ok: false, error: 'failed' };
+    const cancel = () => transfer({ type: 'share-upload-cancel', id }, { timeoutMs: UPLOAD_CANCEL_MS });
+    const chunk = begun.header.chunk;
+    if (!Number.isSafeInteger(chunk) || chunk <= 0) {
+      await cancel();
+      return { ok: false, error: 'failed' };
+    }
+    const step = Math.min(chunk, UPLOAD_CHUNK_MAX_BYTES);
+    let received = 0;
+    while (received < file.size) {
+      const base = received;
+      const end = Math.min(base + step, file.size);
+      const res = await transfer(
+        { type: 'share-upload-chunk', id, offset: base },
+        {
+          signal,
+          frame: file.slice(base, end),
+          timeoutMs: UPLOAD_WRITE_IDLE_MS,
+          replyMs: UPLOAD_REPLY_MS,
+          onSent: (sent) => { if (onProgress) onProgress(base + sent); },
+        },
+      );
+      if (!res.ok) {
+        if (res.error === 'aborted') await cancel();
+        return res;
+      }
+      if (res.header.received !== end) {
+        await cancel();
+        return { ok: false, error: 'failed' };
+      }
+      received = end;
+      if (onProgress) onProgress(received);
+    }
+    const done = await transfer({ type: 'share-upload-finish', id }, { signal });
+    if (!done.ok) {
+      if (done.error === 'aborted') await cancel();
+      return done;
+    }
+    return { ok: true, name: typeof done.header.name === 'string' ? done.header.name : file.name };
+  }
+
   const share = {
+    uploadMaxBytes: UPLOAD_MAX_BYTES,
+    upload,
     version: (signal) => transfer({ type: 'share-version' }, { signal, timeoutMs: POLL_TIMEOUT_MS }),
     list: (signal) => transfer({ type: 'share-list' }, { signal }),
     thumb: (path, signal) => transfer({ type: 'share-thumb', path }, { signal }),

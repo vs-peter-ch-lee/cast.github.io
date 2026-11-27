@@ -95,6 +95,12 @@ h2 { font-size: 25px; }
 h3 { font-size: 16px; }
 .sectionhead { margin: 22px 0 9px; }
 .sectionhead small { color: var(--muted); }
+.headtools { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 4px 12px; }
+.headtools .tool { padding: 6px 14px; font-size: 14px; }
+.headtools .progress { white-space: nowrap; }
+.tool:disabled { opacity: 0.45; cursor: not-allowed; }
+.uploadnote { font-size: 14px; color: var(--muted); margin: 0 0 9px; overflow-wrap: anywhere; }
+.uploadnote.warning { color: var(--warn); }
 .empty { color: var(--muted); font-size: 14px; border-top: 1px solid var(--line); padding: 14px 0; }
 .file { border-top: 1px solid var(--line); display: grid; grid-template-columns: 47px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 14px 0; font-size: 14px; }
 .thumb { width: 47px; height: 38px; display: grid; align-items: center; overflow: hidden; }
